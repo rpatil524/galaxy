@@ -1,17 +1,25 @@
-import type { components } from "@/api/schema";
+import { isHDCA } from "@/api";
+import { type components } from "@/api/schema";
 
 type DatasetState = components["schemas"]["DatasetState"];
 // The 'failed' state is for the collection job state summary, not a dataset state.
-type State = DatasetState | "failed" | "placeholder";
+type State =
+    | DatasetState
+    | "failed"
+    | "placeholder"
+    | "failed_populated_state"
+    | "new_populated_state"
+    | "inaccessible";
 
 interface StateRepresentation {
     status: "success" | "warning" | "info" | "danger" | "secondary";
     text?: string;
     icon?: string;
     spin?: boolean;
+    nonDb?: boolean;
 }
 
-type StateMap = {
+export type StateMap = {
     [__ in State]: StateRepresentation;
 };
 
@@ -103,6 +111,27 @@ export const STATES: StateMap = {
         text: "This dataset is being fetched.",
         icon: "spinner",
         spin: true,
+        nonDb: true,
+    },
+    /** the `populated_state: failed`. This state is only visual and transitional, it does not exist in the database. */
+    failed_populated_state: {
+        status: "danger",
+        text: "Failed to populate the collection.",
+        icon: "exclamation-triangle",
+        nonDb: true,
+    },
+    /** the `populated_state: new`. This state is only visual and transitional, it does not exist in the database. */
+    new_populated_state: {
+        status: "warning",
+        text: "This is a new collection and not all of its data are available yet.",
+        icon: "clock",
+        nonDb: true,
+    },
+    inaccessible: {
+        status: "warning",
+        text: "User not allowed to access this dataset.",
+        icon: "lock",
+        nonDb: true,
     },
 } as const satisfies StateMap;
 
@@ -118,3 +147,26 @@ export const HIERARCHICAL_COLLECTION_JOB_STATES = [
     "queued",
     "new",
 ] as const;
+
+export function getContentItemState(item: any) {
+    if (isHDCA(item)) {
+        if (item.populated_state === "failed") {
+            return "failed_populated_state";
+        }
+        if (item.populated_state === "new") {
+            return "new_populated_state";
+        }
+        if (item.job_state_summary) {
+            for (const jobState of HIERARCHICAL_COLLECTION_JOB_STATES) {
+                if (item.job_state_summary[jobState] > 0) {
+                    return jobState;
+                }
+            }
+        }
+    } else if (item.accessible === false) {
+        return "inaccessible";
+    } else if (item.state) {
+        return item.state;
+    }
+    return "ok";
+}

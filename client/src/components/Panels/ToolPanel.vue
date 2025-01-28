@@ -1,14 +1,12 @@
 <script setup lang="ts">
-import { library } from "@fortawesome/fontawesome-svg-core";
 import { faCaretDown } from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/vue-fontawesome";
-import axios from "axios";
 import { storeToRefs } from "pinia";
-import { computed, onMounted, ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 
-import { getAppRoot } from "@/onload";
-import { type PanelView, useToolStore } from "@/stores/toolStore";
+import { useToolStore } from "@/stores/toolStore";
 import localize from "@/utils/localization";
+import { errorMessageAsString, rethrowSimple } from "@/utils/simple-error";
 
 import { types_to_icons } from "./utilities";
 
@@ -18,13 +16,11 @@ import PanelViewMenu from "./Menus/PanelViewMenu.vue";
 import ToolBox from "./ToolBox.vue";
 import Heading from "@/components/Common/Heading.vue";
 
-library.add(faCaretDown);
-
 const props = defineProps({
     workflow: { type: Boolean, default: false },
-    editorWorkflows: { type: Array, default: null },
     dataManagers: { type: Array, default: null },
     moduleSections: { type: Array, default: null },
+    useSearchWorker: { type: Boolean, default: true },
 });
 
 const emit = defineEmits<{
@@ -35,30 +31,27 @@ const emit = defineEmits<{
 }>();
 
 const arePanelsFetched = ref(false);
-const defaultPanelView = ref("");
 const toolStore = useToolStore();
-const { currentPanelView, isPanelPopulated } = storeToRefs(toolStore);
+const { currentPanelView, defaultPanelView, isPanelPopulated, loading, panel, panelViews, currentPanel } =
+    storeToRefs(toolStore);
 
+const loadingView = ref<string | undefined>(undefined);
 const query = ref("");
-const panelViews = ref<Record<string, PanelView> | null>(null);
 const showAdvanced = ref(false);
+const errorMessage = ref<string | undefined>(undefined);
 
-onMounted(async () => {
-    await axios
-        .get(`${getAppRoot()}api/tool_panels`)
-        .then(async ({ data }) => {
-            const { default_panel_view, views } = data;
-            defaultPanelView.value = default_panel_view;
-            panelViews.value = views;
-            await initializeTools();
-        })
-        .catch((error) => {
-            console.error(error);
-        })
-        .finally(() => {
-            arePanelsFetched.value = true;
-        });
-});
+initializeToolPanel();
+async function initializeToolPanel() {
+    try {
+        await toolStore.fetchPanelViews();
+        await initializeTools();
+    } catch (error) {
+        console.error(error);
+        errorMessage.value = errorMessageAsString(error);
+    } finally {
+        arePanelsFetched.value = true;
+    }
+}
 
 watch(
     () => currentPanelView.value,
@@ -71,7 +64,7 @@ watch(
 watch(
     () => currentPanelView.value,
     async (newVal) => {
-        if (!newVal && arePanelsFetched.value) {
+        if ((!newVal || !panel.value[newVal]) && arePanelsFetched.value) {
             await initializeTools();
         }
     }
@@ -80,6 +73,8 @@ watch(
 const toolPanelHeader = computed(() => {
     if (showAdvanced.value) {
         return localize("Advanced Tool Search");
+    } else if (loading.value && loadingView.value) {
+        return localize(loadingView.value);
     } else if (
         currentPanelView.value !== "default" &&
         panelViews.value &&
@@ -106,17 +101,36 @@ const viewIcon = computed(() => {
     }
 });
 
+const showFavorites = computed({
+    get() {
+        return query.value.includes("#favorites");
+    },
+    set(value) {
+        if (value) {
+            if (!query.value.includes("#favorites")) {
+                query.value = `#favorites ${query.value}`.trim();
+            }
+        } else {
+            query.value = query.value.replace("#favorites", "").trim();
+        }
+    },
+});
+
 async function initializeTools() {
     try {
         await toolStore.fetchTools();
         await toolStore.initCurrentPanelView(defaultPanelView.value);
     } catch (error: any) {
         console.error("ToolPanel - Intialize error:", error);
+        errorMessage.value = errorMessageAsString(error);
+        rethrowSimple(error);
     }
 }
 
 async function updatePanelView(panelView: string) {
+    loadingView.value = panelViews.value[panelView]?.name;
     await toolStore.setCurrentPanelView(panelView);
+    loadingView.value = undefined;
 }
 
 function onInsertTool(toolId: string, toolName: string) {
@@ -134,22 +148,31 @@ function onInsertWorkflow(workflowId: string | undefined, workflowName: string) 
 function onInsertWorkflowSteps(workflowId: string, workflowStepCount: number | undefined) {
     emit("onInsertWorkflowSteps", workflowId, workflowStepCount);
 }
+
+watch(
+    () => query.value,
+    (newQuery) => {
+        showFavorites.value = newQuery.includes("#favorites");
+    }
+);
 </script>
 
 <template>
-    <div v-if="arePanelsFetched" class="unified-panel" aria-labelledby="toolbox-heading">
+    <div v-if="arePanelsFetched" id="toolbox-panel" class="unified-panel" aria-labelledby="toolbox-heading">
         <div unselectable="on">
             <div class="unified-panel-header-inner mx-3 my-2 d-flex justify-content-between">
                 <PanelViewMenu
                     v-if="panelViews && Object.keys(panelViews).length > 1"
                     :panel-views="panelViews"
                     :current-panel-view="currentPanelView"
+                    :show-advanced.sync="showAdvanced"
+                    :store-loading="loading"
                     @updatePanelView="updatePanelView">
                     <template v-slot:panel-view-selector>
                         <div class="d-flex justify-content-between panel-view-selector">
                             <div>
                                 <span
-                                    v-if="viewIcon"
+                                    v-if="viewIcon && !loading"
                                     :class="['fas', `fa-${viewIcon}`, 'mr-1']"
                                     data-description="panel view header icon" />
                                 <Heading
@@ -157,18 +180,21 @@ function onInsertWorkflowSteps(workflowId: string, workflowStepCount: number | u
                                     :class="!showAdvanced && toolPanelHeader !== 'Tools' && 'font-italic'"
                                     h2
                                     inline
-                                    size="sm"
-                                    >{{ toolPanelHeader }}
+                                    size="sm">
+                                    <span v-if="loading && loadingView">
+                                        <LoadingSpan :message="toolPanelHeader" />
+                                    </span>
+                                    <span v-else>{{ toolPanelHeader }}</span>
                                 </Heading>
                             </div>
                             <div v-if="!showAdvanced" class="panel-header-buttons">
-                                <FontAwesomeIcon icon="caret-down" />
+                                <FontAwesomeIcon :icon="faCaretDown" />
                             </div>
                         </div>
                     </template>
                 </PanelViewMenu>
                 <div v-if="!showAdvanced" class="panel-header-buttons">
-                    <FavoritesButton :query="query" @onFavorites="(q) => (query = q)" />
+                    <FavoritesButton v-model="showFavorites" />
                 </div>
             </div>
         </div>
@@ -178,20 +204,28 @@ function onInsertWorkflowSteps(workflowId: string, workflowStepCount: number | u
             :panel-query.sync="query"
             :panel-view="currentPanelView"
             :show-advanced.sync="showAdvanced"
-            :editor-workflows="editorWorkflows"
             :data-managers="dataManagers"
             :module-sections="moduleSections"
+            :use-search-worker="useSearchWorker"
             @updatePanelView="updatePanelView"
             @onInsertTool="onInsertTool"
             @onInsertModule="onInsertModule"
             @onInsertWorkflow="onInsertWorkflow"
             @onInsertWorkflowSteps="onInsertWorkflowSteps" />
+        <div v-else-if="errorMessage" data-description="tool panel error message">
+            <b-alert class="m-2" variant="danger" show>
+                {{ errorMessage }}
+            </b-alert>
+        </div>
         <div v-else>
             <b-badge class="alert-info w-100">
                 <LoadingSpan message="Loading Toolbox" />
             </b-badge>
         </div>
     </div>
+    <b-alert v-else-if="currentPanel" class="m-2" variant="info" show>
+        <LoadingSpan message="Loading Toolbox" />
+    </b-alert>
 </template>
 
 <style lang="scss" scoped>

@@ -25,6 +25,9 @@ const modulesExcludedFromLibs = [
     "elkjs",
     "@citation-js",
     "citeproc",
+    "vega",
+    "vega-embed",
+    "vega-lite",
 ].join("|");
 
 const buildDate = new Date();
@@ -194,6 +197,10 @@ module.exports = (env = {}, argv = {}) => {
                 {
                     test: /\.(txt|tmpl)$/,
                     loader: "raw-loader",
+                },
+                {
+                    test: /\.ya?ml$/,
+                    use: "yaml-loader",
                 },
             ],
         },

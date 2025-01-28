@@ -1,5 +1,6 @@
 import logging
 import uuid
+from collections.abc import MutableMapping
 from typing import (
     Any,
     Dict,
@@ -10,6 +11,7 @@ from typing import (
     Union,
 )
 
+from boltons.iterutils import get_path
 from typing_extensions import Protocol
 
 from galaxy import model
@@ -18,9 +20,10 @@ from galaxy.model import (
     WorkflowInvocation,
     WorkflowInvocationStep,
 )
-from galaxy.model.base import transaction
+from galaxy.model.base import ensure_object_added_to_session
 from galaxy.schema.invocation import (
     CancelReason,
+    FAILURE_REASONS_EXPECTED,
     FailureReason,
     InvocationCancellationHistoryDeleted,
     InvocationFailureCollectionFailed,
@@ -32,6 +35,12 @@ from galaxy.schema.invocation import (
     WarningReason,
 )
 from galaxy.tools.parameters.basic import raw_to_galaxy
+from galaxy.tools.parameters.workflow_utils import (
+    is_runtime_value,
+    NO_REPLACEMENT,
+    NoReplacement,
+)
+from galaxy.tools.parameters.wrapped import nested_key_to_path
 from galaxy.util import ExecutionTimer
 from galaxy.workflow import modules
 from galaxy.workflow.run_request import (
@@ -42,6 +51,7 @@ from galaxy.workflow.run_request import (
 
 if TYPE_CHECKING:
     from galaxy.model import (
+        HistoryItem,
         Workflow,
         WorkflowOutput,
         WorkflowStep,
@@ -113,8 +123,7 @@ def __invoke(
 
     # Be sure to update state of workflow_invocation.
     trans.sa_session.add(workflow_invocation)
-    with transaction(trans.sa_session):
-        trans.sa_session.commit()
+    trans.sa_session.commit()
 
     return outputs, workflow_invocation
 
@@ -137,10 +146,17 @@ def queue_invoke(
         )
     workflow_invocation = workflow_run_config_to_request(trans, workflow_run_config, workflow)
     workflow_invocation.workflow = workflow
-    return trans.app.workflow_scheduling_manager.queue(workflow_invocation, request_params, flush=flush)
+    initial_state = model.WorkflowInvocation.states.NEW
+    if workflow_run_config.requires_materialization:
+        initial_state = model.WorkflowInvocation.states.REQUIRES_MATERIALIZATION
+    return trans.app.workflow_scheduling_manager.queue(
+        workflow_invocation, request_params, flush=flush, initial_state=initial_state
+    )
 
 
 class WorkflowInvoker:
+    progress: "WorkflowProgress"
+
     def __init__(
         self,
         trans: "WorkRequestContext",
@@ -225,6 +241,7 @@ class WorkflowInvoker:
                     workflow_invocation_step = WorkflowInvocationStep()
                     assert workflow_invocation_step
                     workflow_invocation_step.workflow_invocation = workflow_invocation
+                    ensure_object_added_to_session(workflow_invocation_step, object_in_session=workflow_invocation)
                     workflow_invocation_step.workflow_step = step
                     workflow_invocation_step.state = "new"
 
@@ -242,8 +259,12 @@ class WorkflowInvoker:
                 step_delayed = delayed_steps = True
                 self.progress.mark_step_outputs_delayed(step, why=de.why)
             except Exception as e:
-                log.exception(
-                    "Failed to schedule %s, problem occurred on %s.",
+                log_function = log.exception
+                if isinstance(e, modules.FailWorkflowEvaluation) and e.why.reason in FAILURE_REASONS_EXPECTED:
+                    log_function = log.info
+                log_function(
+                    "Failed to schedule %s for %s, problem occurred on %s.",
+                    self.workflow_invocation.log_str(),
                     self.workflow_invocation.workflow.log_str(),
                     step.log_str(),
                 )
@@ -315,6 +336,7 @@ class WorkflowInvoker:
                 )
 
     def _invoke_step(self, invocation_step: WorkflowInvocationStep) -> Optional[bool]:
+        assert invocation_step.workflow_step.module
         incomplete_or_none = invocation_step.workflow_step.module.execute(
             self.trans,
             self.progress,
@@ -344,7 +366,7 @@ class WorkflowProgress:
     def __init__(
         self,
         workflow_invocation: WorkflowInvocation,
-        inputs_by_step_id: Any,
+        inputs_by_step_id: Dict[int, Any],
         module_injector: ModuleInjector,
         param_map: Dict[int, Dict[str, Any]],
         jobs_per_scheduling_iteration: int = -1,
@@ -411,12 +433,13 @@ class WorkflowProgress:
                 remaining_steps.append((step, invocation_step))
         return remaining_steps
 
-    def replacement_for_input(self, trans, step: "WorkflowStep", input_dict: Dict[str, Any]) -> Any:
+    def replacement_for_input(self, trans, step: "WorkflowStep", input_dict: Dict[str, Any]):
         replacement: Union[
-            modules.NoReplacement,
+            NoReplacement,
             model.DatasetCollectionInstance,
             List[model.DatasetCollectionInstance],
-        ] = modules.NO_REPLACEMENT
+            HistoryItem,
+        ] = NO_REPLACEMENT
         prefixed_name = input_dict["name"]
         multiple = input_dict["multiple"]
         is_data = input_dict["input_type"] in ["dataset", "dataset_collection"]
@@ -436,14 +459,21 @@ class WorkflowProgress:
                     replacement = temp
             else:
                 replacement = self.replacement_for_connection(connection[0], is_data=is_data)
-        else:
-            for step_input in step.inputs:
-                if step_input.name == prefixed_name and step_input.default_value_set:
-                    if is_data:
-                        replacement = raw_to_galaxy(trans, step_input.default_value)
+        elif (
+            step.state
+            and (state_input := get_path(step.state.inputs, nested_key_to_path(prefixed_name), None))
+            and not is_runtime_value(state_input)
+        ):
+            # workflow submitted with step parameters populates state directly
+            # via populate_module_and_state
+            replacement = state_input
+        elif (step_input := step.inputs_by_name.get(prefixed_name)) and step_input.default_value_set:
+            replacement = step_input.default_value
+            if is_data:
+                replacement = raw_to_galaxy(trans.app, trans.history, step_input.default_value)
         return replacement
 
-    def replacement_for_connection(self, connection: "WorkflowStepConnection", is_data: bool = True) -> Any:
+    def replacement_for_connection(self, connection: "WorkflowStepConnection", is_data: bool = True):
         output_step_id = connection.output_step.id
         output_name = connection.output_name
         if output_step_id not in self.outputs:
@@ -470,6 +500,8 @@ class WorkflowProgress:
                     dependent_workflow_step_id=output_step_id,
                 )
             )
+        if isinstance(replacement, MutableMapping) and replacement.get("__class__") == "NoReplacement":
+            return NO_REPLACEMENT
         if isinstance(replacement, model.HistoryDatasetCollectionAssociation):
             if not replacement.collection.populated:
                 if not replacement.waiting_for_elements:
@@ -526,7 +558,7 @@ class WorkflowProgress:
 
         return replacement
 
-    def get_replacement_workflow_output(self, workflow_output: "WorkflowOutput") -> Any:
+    def get_replacement_workflow_output(self, workflow_output: "WorkflowOutput"):
         step = workflow_output.workflow_step
         output_name = workflow_output.output_name
         step_outputs = self.outputs[step.id]
@@ -537,7 +569,10 @@ class WorkflowProgress:
             return step_outputs[output_name]
 
     def set_outputs_for_input(
-        self, invocation_step: WorkflowInvocationStep, outputs: Any = None, already_persisted: bool = False
+        self,
+        invocation_step: WorkflowInvocationStep,
+        outputs: Optional[Dict[str, Any]] = None,
+        already_persisted: bool = False,
     ) -> None:
         step = invocation_step.workflow_step
 
@@ -547,21 +582,11 @@ class WorkflowProgress:
         if self.inputs_by_step_id:
             step_id = step.id
             if step_id not in self.inputs_by_step_id and "output" not in outputs:
-                default_value = step.input_default_value
-                if default_value or step.input_optional:
-                    outputs["output"] = default_value
-                else:
-                    log.error(f"{step.log_str()} not found in inputs_step_id {self.inputs_by_step_id}")
-                    raise modules.FailWorkflowEvaluation(
-                        why=InvocationFailureOutputNotFound(
-                            reason=FailureReason.output_not_found,
-                            workflow_step_id=invocation_step.workflow_step_id,
-                            output_name="output",
-                            dependent_workflow_step_id=invocation_step.workflow_step_id,
-                        )
-                    )
+                default_value = step.get_input_default_value(NO_REPLACEMENT)
+                outputs["output"] = default_value
             elif step_id in self.inputs_by_step_id:
-                outputs["output"] = self.inputs_by_step_id[step_id]
+                if self.inputs_by_step_id[step_id] is not None or "output" not in outputs:
+                    outputs["output"] = self.inputs_by_step_id[step_id]
 
         if step.label and step.type == "parameter_input" and "output" in outputs:
             self.runtime_replacements[step.label] = str(outputs["output"])
@@ -592,10 +617,11 @@ class WorkflowProgress:
                     # Add this non-data, non workflow-output output to the workflow outputs.
                     # This is required for recovering the output in the next scheduling iteration,
                     # and should be replaced with a WorkflowInvocationStepOutputValue ASAP.
-                    if not workflow_outputs_by_name.get(output_name) and not output_object == modules.NO_REPLACEMENT:
+                    if not workflow_outputs_by_name.get(output_name) and output_object is not NO_REPLACEMENT:
                         workflow_output = model.WorkflowOutput(step, output_name=output_name)
                         step.workflow_outputs.append(workflow_output)
             for workflow_output in step.workflow_outputs:
+                assert workflow_output.output_name
                 output_name = workflow_output.output_name
                 if output_name not in outputs:
                     invocation_step.workflow_invocation.add_message(
@@ -616,6 +642,8 @@ class WorkflowProgress:
                 )
 
     def _record_workflow_output(self, step: "WorkflowStep", workflow_output: "WorkflowOutput", output: Any) -> None:
+        if output is NO_REPLACEMENT:
+            output = {"__class__": "NoReplacement"}
         self.workflow_invocation.add_output(workflow_output, step, output)
 
     def mark_step_outputs_delayed(self, step: "WorkflowStep", why: Optional[str] = None) -> None:
@@ -628,6 +656,7 @@ class WorkflowProgress:
         workflow_invocation = self.workflow_invocation
         subworkflow_invocation = workflow_invocation.get_subworkflow_invocation_for_step(step)
         if subworkflow_invocation is None:
+            assert step.order_index
             raise MessageException(f"Failed to find persisted subworkflow invocation for step [{step.order_index + 1}]")
         return subworkflow_invocation
 
@@ -704,9 +733,10 @@ class WorkflowProgress:
         )
 
     def raw_to_galaxy(self, value: dict):
-        return raw_to_galaxy(self.module_injector.trans, value)
+        return raw_to_galaxy(self.module_injector.trans.app, self.module_injector.trans.history, value)
 
     def _recover_mapping(self, step_invocation: WorkflowInvocationStep) -> None:
+        assert step_invocation.workflow_step.module
         try:
             step_invocation.workflow_step.module.recover_mapping(step_invocation, self)
         except modules.DelayedWorkflowEvaluation as de:

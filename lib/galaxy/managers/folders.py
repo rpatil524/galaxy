@@ -1,6 +1,7 @@
 """
 Manager and Serializer for Library Folders.
 """
+
 import logging
 from dataclasses import dataclass
 from typing import (
@@ -19,11 +20,11 @@ from sqlalchemy import (
     or_,
     select,
 )
-from sqlalchemy.orm import aliased
-from sqlalchemy.orm.exc import (
+from sqlalchemy.exc import (
     MultipleResultsFound,
     NoResultFound,
 )
+from sqlalchemy.orm import aliased
 
 from galaxy import (
     model,
@@ -47,9 +48,7 @@ from galaxy.model import (
     LibraryFolder,
     LibraryFolderPermissions,
 )
-from galaxy.model.base import transaction
 from galaxy.model.scoped_session import galaxy_scoped_session
-from galaxy.schema.fields import LibraryFolderDatabaseIdField
 from galaxy.schema.schema import LibraryFolderContentsIndexQueryPayload
 from galaxy.security import RBACAgent
 
@@ -186,10 +185,6 @@ class FolderManager:
 
         """
         folder_dict = folder.to_dict(view="element")
-        folder_dict = trans.security.encode_all_ids(folder_dict, True)
-        folder_dict["id"] = f"F{folder_dict['id']}"
-        if folder_dict["parent_id"] is not None:
-            folder_dict["parent_id"] = f"F{folder_dict['parent_id']}"
         folder_dict["update_time"] = folder.update_time
         return folder_dict
 
@@ -224,8 +219,7 @@ class FolderManager:
         new_folder.genome_build = trans.app.genome_builds.default_value
         parent_folder.add_folder(new_folder)
         trans.sa_session.add(new_folder)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         # New folders default to having the same permissions as their parent folder
         trans.app.security_agent.copy_library_permissions(trans, parent_folder, new_folder)
         return new_folder
@@ -259,8 +253,7 @@ class FolderManager:
             changed = True
         if changed:
             trans.sa_session.add(folder)
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
         return folder
 
     def delete(self, trans, folder, undelete=False):
@@ -284,8 +277,7 @@ class FolderManager:
         else:
             folder.deleted = True
         trans.sa_session.add(folder)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return folder
 
     def get_current_roles(self, trans, folder):
@@ -540,18 +532,19 @@ class FolderManager:
 
     def build_folder_path(
         self, sa_session: galaxy_scoped_session, folder: model.LibraryFolder
-    ) -> List[Tuple[str, str]]:
+    ) -> List[Tuple[int, Optional[str]]]:
         """
         Returns the folder path from root to the given folder.
 
         The path items are tuples with the name and id of each folder for breadcrumb building purposes.
         """
         current_folder = folder
-        path_to_root = [(LibraryFolderDatabaseIdField.encode(current_folder.id), current_folder.name)]
+        path_to_root = [(current_folder.id, current_folder.name)]
         while current_folder.parent_id is not None:
             parent_folder = sa_session.get(LibraryFolder, current_folder.parent_id)
+            assert parent_folder
             current_folder = parent_folder
-            path_to_root.insert(0, (LibraryFolderDatabaseIdField.encode(current_folder.id), current_folder.name))
+            path_to_root.insert(0, (current_folder.id, current_folder.name))
         return path_to_root
 
 

@@ -2,7 +2,9 @@ import configparser
 import logging
 import os
 import re
+import tempfile
 from typing import (
+    List,
     Optional,
     Tuple,
     TYPE_CHECKING,
@@ -21,7 +23,6 @@ from galaxy import (
     util,
     web,
 )
-from galaxy.model.base import transaction
 from galaxy.tool_shed.util.repository_util import (
     create_or_update_tool_shed_repository,
     extract_components_from_tuple,
@@ -163,23 +164,18 @@ def create_repo_info_dict(
 def create_repository_admin_role(app: "ToolShedApp", repository: "Repository"):
     """
     Create a new role with name-spaced name based on the repository name and its owner's public user
-    name.  This will ensure that the tole name is unique.
+    name.  This will ensure that the role name is unique.
     """
     sa_session = app.model.session
     name = get_repository_admin_role_name(str(repository.name), str(repository.user.username))
     description = "A user or group member with this role can administer this repository."
     role = app.model.Role(name=name, description=description, type=app.model.Role.types.SYSTEM)
     sa_session.add(role)
-    session = sa_session()
-    with transaction(session):
-        session.commit()
     # Associate the role with the repository owner.
     app.model.UserRoleAssociation(repository.user, role)
     # Associate the role with the repository.
     rra = app.model.RepositoryRoleAssociation(repository, role)
     sa_session.add(rra)
-    with transaction(session):
-        session.commit()
     return role
 
 
@@ -189,8 +185,8 @@ def create_repository(
     type: str,
     description,
     long_description,
-    user_id,
-    category_ids=None,
+    user,
+    category_ids: Optional[List[str]] = None,
     remote_repository_url=None,
     homepage_url=None,
 ) -> Tuple["Repository", str]:
@@ -205,43 +201,37 @@ def create_repository(
         homepage_url=homepage_url,
         description=description,
         long_description=long_description,
-        user_id=user_id,
+        user=user,
     )
-    # Flush to get the id.
     sa_session.add(repository)
-    session = sa_session()
-    with transaction(session):
-        session.commit()
-    # Create an admin role for the repository.
-    create_repository_admin_role(app, repository)
-    # Determine the repository's repo_path on disk.
-    dir = os.path.join(app.config.file_path, *util.directory_hash_id(repository.id))
-    # Create directory if it does not exist.
-    if not os.path.exists(dir):
-        os.makedirs(dir)
-    # Define repo name inside hashed directory.
-    repository_path = os.path.join(dir, "repo_%d" % repository.id)
-    # Create local repository directory.
-    if not os.path.exists(repository_path):
-        os.makedirs(repository_path)
-    # Create the local repository.
-    init_repository(repo_path=repository_path)
-    # Add an entry in the hgweb.config file for the local repository.
-    lhs = f"repos/{repository.user.username}/{repository.name}"
-    app.hgweb_config_manager.add_entry(lhs, repository_path)
-    # Create a .hg/hgrc file for the local repository.
-    create_hgrc_file(app, repository)
-    flush_needed = False
     if category_ids:
         # Create category associations
         for category_id in category_ids:
             category = sa_session.get(app.model.Category, app.security.decode_id(category_id))
             rca = app.model.RepositoryCategoryAssociation(repository, category)
             sa_session.add(rca)
-            flush_needed = True
-    if flush_needed:
-        with transaction(session):
-            session.commit()
+    # Create an admin role for the repository.
+    create_repository_admin_role(app, repository)
+    # Create a temporary repo_path on disk.
+    repository_path = tempfile.mkdtemp(
+        dir=app.config.file_path,
+        prefix=f"{repository.user.username}-{repository.name}",
+    )
+    # Created directory is readable, writable, and searchable only by the creating user ID,
+    # but we need to make it world-readable so non-shed user can serve files (e.g. hgweb run as different user).
+    os.chmod(repository_path, util.RWXR_XR_X)
+    # Create the local repository.
+    init_repository(repo_path=repository_path)
+    # Create a .hg/hgrc file for the local repository.
+    create_hgrc_file(app, repository, repo_path=repository_path)
+    # Add an entry in the hgweb.config file for the local repository.
+    lhs = f"{app.config.hgweb_repo_prefix}{repository.user.username}/{repository.name}"
+    # Flush to get the id.
+    session = sa_session()
+    session.commit()
+    final_repository_path = repository.ensure_hg_repository_path(app.config.file_path)
+    os.rename(repository_path, final_repository_path)
+    app.hgweb_config_manager.add_entry(lhs, final_repository_path)
     # Update the repository registry.
     app.repository_registry.add_entry(repository)
     message = f"Repository <b>{escape(str(repository.name))}</b> has been created."
@@ -398,12 +388,7 @@ def handle_role_associations(app: "ToolShedApp", role, repository, **kwd):
             roles=[role], users=in_users, groups=in_groups, repositories=in_repositories
         )
         sa_session.refresh(role)
-        message += "Role <b>%s</b> has been associated with %d users, %d groups and %d repositories.  " % (
-            escape(str(role.name)),
-            len(in_users),
-            len(in_groups),
-            len(in_repositories),
-        )
+        message += f"Role <b>{escape(str(role.name))}</b> has been associated with {len(in_users)} users, {len(in_groups)} groups and {len(in_repositories)} repositories.  "
     in_users = []
     out_users = []
     in_groups = []
@@ -440,16 +425,26 @@ def change_repository_name_in_hgrc_file(hgrc_file: str, new_name: str) -> None:
 def update_repository(trans: "ProvidesUserContext", id: str, **kwds) -> Tuple[Optional["Repository"], Optional[str]]:
     """Update an existing ToolShed repository"""
     app = trans.app
-    message = None
-    flush_needed = False
     sa_session = app.model.session
     repository = sa_session.get(app.model.Repository, app.security.decode_id(id))
     if repository is None:
         return None, "Unknown repository ID"
 
-    if not (trans.user_is_admin or trans.app.security_agent.user_can_administer_repository(trans.user, repository)):
+    if not (trans.user_is_admin or app.security_agent.user_can_administer_repository(trans.user, repository)):
         message = "You are not the owner of this repository, so you cannot administer it."
         return None, message
+
+    return update_validated_repository(trans, repository, **kwds)
+
+
+def update_validated_repository(
+    trans: "ProvidesUserContext", repository: "Repository", **kwds
+) -> Tuple[Optional["Repository"], Optional[str]]:
+    """Update an existing ToolShed repository metadata once permissions have been checked."""
+    app = trans.app
+    sa_session = app.model.session
+    message = None
+    flush_needed = False
 
     # Allowlist properties that can be changed via this method
     for key in ("type", "description", "long_description", "remote_repository_url", "homepage_url"):
@@ -459,10 +454,9 @@ def update_repository(trans: "ProvidesUserContext", id: str, **kwds) -> Tuple[Op
             flush_needed = True
 
     if "category_ids" in kwds and isinstance(kwds["category_ids"], list):
+
         # Remove existing category associations
-        delete_repository_category_associations(
-            sa_session, app.model.RepositoryCategoryAssociation, app.security.decode_id(id)
-        )
+        delete_repository_category_associations(sa_session, app.model.RepositoryCategoryAssociation, repository.id)
 
         # Then (re)create category associations
         for category_id in kwds["category_ids"]:
@@ -485,8 +479,8 @@ def update_repository(trans: "ProvidesUserContext", id: str, **kwds) -> Tuple[Op
 
         repo_dir = repository.repo_path(app)
         # Change the entry in the hgweb.config file for the repository.
-        old_lhs = f"repos/{repository.user.username}/{repository.name}"
-        new_lhs = f"repos/{repository.user.username}/{kwds['name']}"
+        old_lhs = f"{trans.app.config.hgweb_repo_prefix}{repository.user.username}/{repository.name}"
+        new_lhs = f"{trans.app.config.hgweb_repo_prefix}{repository.user.username}/{kwds['name']}"
         trans.app.hgweb_config_manager.change_entry(old_lhs, new_lhs, repo_dir)
 
         # Change the entry in the repository's hgrc file.
@@ -502,8 +496,7 @@ def update_repository(trans: "ProvidesUserContext", id: str, **kwds) -> Tuple[Op
 
     if flush_needed:
         trans.sa_session.add(repository)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         message = "The repository information has been updated."
     else:
         message = None

@@ -15,7 +15,6 @@ from sqlalchemy.sql.expression import func
 
 import galaxy.model
 from galaxy.exceptions import ItemOwnershipException
-from galaxy.model.base import transaction
 from galaxy.model.scoped_session import galaxy_scoped_session
 from galaxy.util import (
     strip_control_characters,
@@ -61,7 +60,7 @@ class TagHandler:
         self.item_tag_assoc_info: Dict[str, ItemTagAssocInfo] = {}
         # Can't include type annotation in signature, because lagom will attempt to look up
         # GalaxySession, but can't find it due to the circular import
-        self.galaxy_session: Optional["GalaxySession"] = galaxy_session
+        self.galaxy_session: Optional[GalaxySession] = galaxy_session
 
     def create_tag_handler_session(self, galaxy_session: Optional["GalaxySession"]):
         # Creates a transient tag handler that avoids repeated flushes
@@ -93,8 +92,8 @@ class TagHandler:
         new_tags_str = ",".join(new_tags_list)
         self.apply_item_tags(user, item, unicodify(new_tags_str, "utf-8"), flush=flush)
         if flush:
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
+        item.update()
         return item.tags
 
     def get_tag_assoc_class(self, item_class):
@@ -147,9 +146,8 @@ class TagHandler:
         """Remove a tag from an item."""
         self._ensure_user_owns_item(user, item)
         # Get item tag association.
-        item_tag_assoc = self._get_item_tag_assoc(user, item, tag_name)
         # Remove association.
-        if item_tag_assoc:
+        if item_tag_assoc := self._get_item_tag_assoc(user, item, tag_name):
             # Delete association.
             self.sa_session.delete(item_tag_assoc)
             item.tags.remove(item_tag_assoc)
@@ -195,6 +193,7 @@ class TagHandler:
     def item_has_tag(self, user, item, tag):
         """Returns true if item is has a given tag."""
         # Get tag name.
+        tag_name = None
         if isinstance(tag, str):
             tag_name = tag
         elif isinstance(tag, galaxy.model.Tag):
@@ -246,8 +245,7 @@ class TagHandler:
         item_tag_assoc.user_value = value
         item_tag_assoc.value = lc_value
         if flush:
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
         return item_tag_assoc
 
     def apply_item_tags(
@@ -296,7 +294,14 @@ class TagHandler:
         return None
 
     def _create_tag(self, tag_str: str):
-        """Create a Tag object from a tag string."""
+        """
+        Create or retrieve one or more Tag objects from a tag string. If there are multiple
+        hierarchical tags in the tag string, the string will be split along `self.hierarchy_separator` chars.
+        A Tag instance will be created for each non-empty prefix. If a prefix corresponds to the
+        name of an existing tag, that tag will be retrieved; otherwise, a new Tag object will be created.
+        For example, for the tag string `a.b.c` 3 Tag instances will be created: `a`, `a.b`, `a.b.c`.
+        Return the last tag created (`a.b.c`).
+        """
         tag_hierarchy = tag_str.split(self.hierarchy_separator)
         tag_prefix = ""
         parent_tag = None
@@ -328,8 +333,7 @@ class TagHandler:
         with Session() as separate_session:
             separate_session.add(tag)
             try:
-                with transaction(separate_session):
-                    separate_session.commit()
+                separate_session.commit()
             except IntegrityError:
                 # tag already exists, get from database
                 separate_session.rollback()
@@ -370,7 +374,7 @@ class TagHandler:
         """
         # Gracefully handle None.
         if not tag_str:
-            return dict()
+            return {}
         # Strip unicode control characters
         tag_str = strip_control_characters(tag_str)
         # Split tags based on separators.
@@ -424,7 +428,7 @@ class TagHandler:
 
     def _scrub_tag_name_list(self, tag_name_list):
         """Scrub a tag name list."""
-        scrubbed_tag_list = list()
+        scrubbed_tag_list = []
         for tag in tag_name_list:
             scrubbed_tag_list.append(self._scrub_tag_name(tag))
         return scrubbed_tag_list
@@ -494,7 +498,7 @@ class GalaxyTagHandlerSession(GalaxyTagHandler):
 
     def __init__(self, sa_session, galaxy_session: Optional["GalaxySession"]):
         super().__init__(sa_session, galaxy_session)
-        self.created_tags: Dict[str, "Tag"] = {}
+        self.created_tags: Dict[str, Tag] = {}
 
     def _get_tag(self, tag_name):
         """Get tag from cache or database."""

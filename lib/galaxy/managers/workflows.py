@@ -14,6 +14,7 @@ from typing import (
 )
 
 import sqlalchemy
+import yaml
 from gxformat2 import (
     from_galaxy_native,
     ImporterGalaxyInterface,
@@ -23,8 +24,15 @@ from gxformat2 import (
 from gxformat2.abstract import from_dict
 from gxformat2.cytoscape import to_cytoscape
 from gxformat2.yaml import ordered_dump
-from pydantic import BaseModel
+from pydantic import (
+    BaseModel,
+    SerializerFunctionWrapHandler,
+    WrapSerializer,
+)
 from sqlalchemy import (
+    and_,
+    Cast,
+    ColumnElement,
     desc,
     false,
     func,
@@ -32,11 +40,15 @@ from sqlalchemy import (
     select,
     true,
 )
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import (
     aliased,
     joinedload,
-    Query,
     subqueryload,
+)
+from typing_extensions import (
+    Annotated,
+    TypeAlias,
 )
 
 from galaxy import (
@@ -49,7 +61,10 @@ from galaxy.managers import (
     deletable,
     sharable,
 )
-from galaxy.managers.base import decode_id
+from galaxy.managers.base import (
+    decode_id,
+    security_check,
+)
 from galaxy.managers.context import ProvidesUserContext
 from galaxy.managers.executables import artifact_class
 from galaxy.model import (
@@ -64,8 +79,9 @@ from galaxy.model import (
     Workflow,
     WorkflowInvocation,
     WorkflowInvocationStep,
+    WorkflowInvocationToSubworkflowInvocationAssociation,
 )
-from galaxy.model.base import transaction
+from galaxy.model.base import ensure_object_added_to_session
 from galaxy.model.index_filter_util import (
     append_user_filter,
     raw_text_column_filter,
@@ -83,6 +99,9 @@ from galaxy.tools.parameters import (
 from galaxy.tools.parameters.basic import (
     DataCollectionToolParameter,
     DataToolParameter,
+)
+from galaxy.tools.parameters.workflow_utils import (
+    ConnectedValue,
     RuntimeValue,
     workflow_building_modes,
 )
@@ -97,7 +116,6 @@ from galaxy.util.search import (
     parse_filters_structured,
     RawTextTerm,
 )
-from galaxy.web import url_for
 from galaxy.work.context import WorkRequestContext
 from galaxy.workflow.modules import (
     module_factory,
@@ -120,6 +138,7 @@ from galaxy.workflow.steps import (
     attach_ordered_steps,
     has_cycles,
 )
+from galaxy.workflow.trs_proxy import TrsProxy
 
 log = logging.getLogger(__name__)
 
@@ -178,13 +197,18 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
             filters.append(StoredWorkflow.published == true())
 
         stmt = select(StoredWorkflow)
+
+        # Do not include workflows authored by deleted users
+        if show_published or show_shared:
+            stmt = stmt.join(StoredWorkflow.user).where(User.deleted == false())
+
         if show_shared:
             stmt = stmt.outerjoin(StoredWorkflow.users_shared_with)
         stmt = stmt.outerjoin(StoredWorkflow.tags)
 
         latest_workflow_load = joinedload(StoredWorkflow.latest_workflow)
         if not payload.skip_step_counts:
-            latest_workflow_load = latest_workflow_load.undefer("step_count")
+            latest_workflow_load = latest_workflow_load.undefer(Workflow.step_count)  # type:ignore[arg-type]
         latest_workflow_load = latest_workflow_load.lazyload(Workflow.steps)
 
         stmt = stmt.options(joinedload(StoredWorkflow.annotations))
@@ -222,12 +246,18 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
                             stmt = stmt.where(StoredWorkflow.importable == true())
                         elif q == "deleted":
                             stmt = stmt.where(StoredWorkflow.deleted == true())
-                            show_deleted = true
+                            show_deleted = True
                         elif q == "shared_with_me":
                             if not show_shared:
                                 message = "Can only use tag is:shared_with_me if show_shared parameter also true."
                                 raise exceptions.RequestParameterInvalidException(message)
                             stmt = stmt.where(StoredWorkflowUserShareAssociation.user == user)
+                        elif q == "bookmarked":
+                            stmt = (
+                                stmt.join(model.StoredWorkflowMenuEntry)
+                                .where(model.StoredWorkflowMenuEntry.stored_workflow_id == StoredWorkflow.id)
+                                .where(model.StoredWorkflowMenuEntry.user_id == user.id)
+                            )
                 elif isinstance(term, RawTextTerm):
                     tf = w_tag_filter(term.text, False)
                     alias = aliased(User)
@@ -242,7 +272,7 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
                             term,
                         )
                     )
-        stmt = stmt.where(StoredWorkflow.deleted == (true() if show_deleted else false()))
+        stmt = stmt.where(StoredWorkflow.deleted == (true() if show_deleted else false())).distinct()
         if include_total_count:
             total_matches = get_count(trans.sa_session, stmt)
         else:
@@ -261,7 +291,7 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         if payload.offset is not None:
             stmt = stmt.offset(payload.offset)
         result = trans.sa_session.scalars(stmt).unique()
-        return result, total_matches
+        return result, total_matches  # type:ignore[return-value]
 
     def get_stored_workflow(self, trans, workflow_id, by_stored_id=True) -> StoredWorkflow:
         """Use a supplied ID (UUID or encoded stored workflow ID) to find
@@ -312,8 +342,7 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
                 user=trans.user, name=workflow.name, workflow=workflow, hidden=True
             )
             trans.sa_session.add(stored_workflow)
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
             return stored_workflow
 
     def get_owned_workflow(self, trans, encoded_workflow_id):
@@ -337,10 +366,10 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         if isinstance(has_workflow, model.WorkflowInvocation):
             # We use the owner of the history that is associated to the invocation as a proxy
             # for the owner of the invocation.
-            if trans.user != has_workflow.history.user and not trans.user_is_admin:
-                raise exceptions.ItemOwnershipException()
-            else:
-                return True
+            security_check(
+                trans, has_workflow.history, check_ownership=check_ownership, check_accessible=check_accessible
+            )
+            return True
 
         # stored workflow contains security stuff - follow that workflow to
         # that unless given a stored workflow.
@@ -361,9 +390,10 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
 
         return True
 
-    def get_workflow_svg_from_id(self, trans, id, for_embed=False) -> bytes:
+    def get_workflow_svg_from_id(self, trans, id, version=None, for_embed=False) -> bytes:
         stored = self.get_stored_accessible_workflow(trans, id)
-        return self.get_workflow_svg(trans, stored.latest_workflow, for_embed=for_embed)
+        workflow = stored.get_internal_version(version)
+        return self.get_workflow_svg(trans, workflow, for_embed=for_embed)
 
     def get_workflow_svg(self, trans, workflow, for_embed=False) -> bytes:
         try:
@@ -393,20 +423,26 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         workflow_canvas.add_steps()
         return workflow_canvas.finish(for_embed=for_embed)
 
-    def get_invocation(self, trans, decoded_invocation_id, eager=False) -> WorkflowInvocation:
+    def get_invocation(
+        self, trans, decoded_invocation_id: int, eager=False, check_ownership=True, check_accessible=True
+    ) -> WorkflowInvocation:
         workflow_invocation = _get_invocation(trans.sa_session, eager, decoded_invocation_id)
         if not workflow_invocation:
             encoded_wfi_id = trans.security.encode_id(decoded_invocation_id)
             message = f"'{encoded_wfi_id}' is not a valid workflow invocation id"
             raise exceptions.ObjectNotFound(message)
-        self.check_security(trans, workflow_invocation, check_ownership=True, check_accessible=False)
+        self.check_security(
+            trans, workflow_invocation, check_ownership=check_ownership, check_accessible=check_accessible
+        )
         return workflow_invocation
 
     def get_invocation_report(self, trans, invocation_id, **kwd):
         decoded_workflow_invocation_id = (
             trans.security.decode_id(invocation_id) if isinstance(invocation_id, str) else invocation_id
         )
-        workflow_invocation = self.get_invocation(trans, decoded_workflow_invocation_id)
+        workflow_invocation = self.get_invocation(
+            trans, decoded_workflow_invocation_id, check_ownership=False, check_accessible=True
+        )
         generator_plugin_type = kwd.get("generator_plugin_type")
         runtime_report_config_json = kwd.get("runtime_report_config_json")
         invocation_markdown = kwd.get("invocation_markdown", None)
@@ -422,25 +458,29 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         )
 
     def request_invocation_cancellation(self, trans, decoded_invocation_id: int):
-        workflow_invocation = self.get_invocation(trans, decoded_invocation_id)
+        workflow_invocation = self.get_invocation(trans, decoded_invocation_id, check_ownership=True)
         cancelled = workflow_invocation.cancel()
 
         if cancelled:
             workflow_invocation.add_message(InvocationCancellationUserRequest(reason="user_request"))
             trans.sa_session.add(workflow_invocation)
 
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
 
         return workflow_invocation
 
-    def get_invocation_step(self, trans, decoded_workflow_invocation_step_id):
+    def get_invocation_step(
+        self, trans, decoded_workflow_invocation_step_id, check_ownership=True, check_accessible=True
+    ):
         try:
             workflow_invocation_step = trans.sa_session.get(WorkflowInvocationStep, decoded_workflow_invocation_step_id)
         except Exception:
             raise exceptions.ObjectNotFound()
         self.check_security(
-            trans, workflow_invocation_step.workflow_invocation, check_ownership=True, check_accessible=False
+            trans,
+            workflow_invocation_step.workflow_invocation,
+            check_ownership=check_ownership,
+            check_accessible=check_accessible,
         )
         return workflow_invocation_step
 
@@ -462,8 +502,7 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         performed_action = module.do_invocation_step_action(step, action)
         workflow_invocation_step.action = performed_action
         trans.sa_session.add(workflow_invocation_step)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return workflow_invocation_step
 
     def build_invocations_query(
@@ -478,7 +517,9 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         offset=None,
         sort_by=None,
         sort_desc=None,
-    ) -> Tuple[Query, int]:
+        include_nested_invocations=True,
+        check_ownership=True,
+    ) -> Tuple[List, int]:
         """Get invocations owned by the current user."""
 
         stmt = select(WorkflowInvocation)
@@ -495,6 +536,16 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
             stmt = stmt.join(WorkflowInvocationStep).where(WorkflowInvocationStep.job_id == job_id)
         if not include_terminal:
             stmt = stmt.where(WorkflowInvocation.state.in_(WorkflowInvocation.non_terminal_states))
+        if not include_nested_invocations:
+            subquery = (
+                select(WorkflowInvocationToSubworkflowInvocationAssociation.id)
+                .where(
+                    WorkflowInvocationToSubworkflowInvocationAssociation.subworkflow_invocation_id
+                    == WorkflowInvocation.id
+                )
+                .exists()
+            )
+            stmt = stmt.where(~subquery)
 
         total_matches = get_count(trans.sa_session, stmt)
 
@@ -514,7 +565,7 @@ class WorkflowsManager(sharable.SharableModelManager, deletable.DeletableManager
         invocations = [
             inv
             for inv in trans.sa_session.scalars(stmt)
-            if self.check_security(trans, inv, check_ownership=True, check_accessible=False)
+            if self.check_security(trans, inv, check_ownership=check_ownership, check_accessible=True)
         ]
         return invocations, total_matches
 
@@ -549,8 +600,10 @@ class WorkflowSerializer(sharable.SharableModelSerializer):
 
 
 class WorkflowContentsManager(UsesAnnotations):
-    def __init__(self, app: MinimalManagerApp):
+
+    def __init__(self, app: MinimalManagerApp, trs_proxy: TrsProxy):
         self.app = app
+        self.trs_proxy = trs_proxy
         self._resource_mapper_function = get_resource_mapper_function(app)
 
     def ensure_raw_description(self, dict_or_raw_description):
@@ -569,7 +622,7 @@ class WorkflowContentsManager(UsesAnnotations):
         import_options = ImportOptions()
         import_options.deduplicate_subworkflows = True
         as_dict = python_to_workflow(as_dict, galaxy_interface, workflow_directory=None, import_options=import_options)
-        raw_description = RawWorkflowDescription(as_dict, path)
+        raw_description = RawWorkflowDescription(as_dict)
         created_workflow = self.build_workflow_from_raw_description(trans, raw_description, WorkflowCreateOptions())
         return created_workflow.workflow
 
@@ -598,9 +651,12 @@ class WorkflowContentsManager(UsesAnnotations):
             galaxy_interface = Format2ConverterGalaxyInterface()
             import_options = ImportOptions()
             import_options.deduplicate_subworkflows = True
-            as_dict = python_to_workflow(
-                as_dict, galaxy_interface, workflow_directory=workflow_directory, import_options=import_options
-            )
+            try:
+                as_dict = python_to_workflow(
+                    as_dict, galaxy_interface, workflow_directory=workflow_directory, import_options=import_options
+                )
+            except yaml.scanner.ScannerError as e:
+                raise exceptions.MalformedContents(str(e))
 
         return RawWorkflowDescription(as_dict, workflow_path)
 
@@ -662,8 +718,7 @@ class WorkflowContentsManager(UsesAnnotations):
             menuEntry.stored_workflow = stored
             trans.user.stored_workflow_menu_entries.append(menuEntry)
 
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
 
         return CreatedWorkflow(stored_workflow=stored, workflow=workflow, missing_tools=missing_tool_tups)
 
@@ -684,9 +739,10 @@ class WorkflowContentsManager(UsesAnnotations):
         )
 
         if missing_tool_tups and not workflow_update_options.allow_missing_tools:
-            errors = []
-            for missing_tool_tup in missing_tool_tups:
-                errors.append("Step %i: Requires tool '%s'." % (int(missing_tool_tup[3]) + 1, missing_tool_tup[0]))
+            errors = [
+                f"Step {int(missing_tool_tup[3]) + 1}: Requires tool '{missing_tool_tup[0]}'."
+                for missing_tool_tup in missing_tool_tups
+            ]
             raise MissingToolsException(workflow, errors)
 
         # Connect up
@@ -705,7 +761,8 @@ class WorkflowContentsManager(UsesAnnotations):
             trans.tag_handler.set_tags_from_list(
                 trans.user,
                 stored_workflow,
-                data.get("tags", []),
+                data["tags"],
+                flush=False,
             )
 
         if workflow_update_options.update_stored_workflow_attributes:
@@ -723,8 +780,7 @@ class WorkflowContentsManager(UsesAnnotations):
 
         # Persist
         if not dry_run:
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
             if stored_workflow.from_path:
                 self._sync_stored_workflow(trans, stored_workflow)
         # Return something informative
@@ -761,18 +817,17 @@ class WorkflowContentsManager(UsesAnnotations):
         workflow.license = data.get("license")
         workflow.creator_metadata = data.get("creator")
 
-        if hasattr(workflow_state_resolution_options, "archive_source"):
-            if workflow_state_resolution_options.archive_source:
-                source_metadata = {}
-                if workflow_state_resolution_options.archive_source == "trs_tool":
-                    source_metadata["trs_tool_id"] = workflow_state_resolution_options.trs_tool_id
-                    source_metadata["trs_version_id"] = workflow_state_resolution_options.trs_version_id
-                    source_metadata["trs_server"] = workflow_state_resolution_options.trs_server
-                    source_metadata["trs_url"] = workflow_state_resolution_options.trs_url
-                elif not workflow_state_resolution_options.archive_source.startswith("file://"):  # URL import
-                    source_metadata["url"] = workflow_state_resolution_options.archive_source
-                workflow_state_resolution_options.archive_source = None  # so trs_id is not set for subworkflows
-                workflow.source_metadata = source_metadata
+        if getattr(workflow_state_resolution_options, "archive_source", None):
+            source_metadata = {}
+            if workflow_state_resolution_options.archive_source in ("trs_tool", "trs_url"):
+                source_metadata["trs_tool_id"] = workflow_state_resolution_options.trs_tool_id
+                source_metadata["trs_version_id"] = workflow_state_resolution_options.trs_version_id
+                source_metadata["trs_server"] = workflow_state_resolution_options.trs_server
+                source_metadata["trs_url"] = workflow_state_resolution_options.trs_url
+            elif not workflow_state_resolution_options.archive_source.startswith("file://"):  # URL import
+                source_metadata["url"] = workflow_state_resolution_options.archive_source
+            workflow_state_resolution_options.archive_source = None  # so trs_id is not set for subworkflows
+            workflow.source_metadata = source_metadata
 
         # Assume no errors until we find a step that has some
         workflow.has_errors = False
@@ -783,9 +838,8 @@ class WorkflowContentsManager(UsesAnnotations):
         steps_by_external_id: Dict[str, model.WorkflowStep] = {}
 
         # Preload dependent workflows with locally defined content_ids.
-        subworkflows = data.get("subworkflows")
         subworkflow_id_map = None
-        if subworkflows:
+        if subworkflows := data.get("subworkflows"):
             subworkflow_id_map = {}
             for key, subworkflow_dict in subworkflows.items():
                 subworkflow = self.__build_embedded_subworkflow(
@@ -803,7 +857,7 @@ class WorkflowContentsManager(UsesAnnotations):
                     trans, step_dict, subworkflow_id_map, workflow_state_resolution_options, dry_run=dry_run
                 )
 
-        module_kwds = workflow_state_resolution_options.dict()
+        module_kwds = workflow_state_resolution_options.model_dump()
         module_kwds.update(kwds)  # TODO: maybe drop this?
         for step_dict in self.__walk_step_dicts(data):
             module, step = self.__module_from_dict(trans, steps, steps_by_external_id, step_dict, **module_kwds)
@@ -819,6 +873,11 @@ class WorkflowContentsManager(UsesAnnotations):
 
         workflow.has_cycles = True
         workflow.steps = steps
+        # Safeguard: workflow was implicitly merged into this Session prior to SQLAlchemy 2.0.
+        # when AT LEAST ONE step in steps belonged to a session.
+        for step in steps:
+            if ensure_object_added_to_session(workflow, object_in_session=step):
+                break
 
         comments: List[model.WorkflowComment] = []
         comments_by_external_id: Dict[str, model.WorkflowComment] = {}
@@ -873,9 +932,9 @@ class WorkflowContentsManager(UsesAnnotations):
         if style == "editor":
             wf_dict = self._workflow_to_dict_editor(trans, stored, workflow)
         elif style == "legacy":
-            wf_dict = self._workflow_to_dict_instance(stored, workflow=workflow, legacy=True)
+            wf_dict = self._workflow_to_dict_instance(trans, stored, workflow=workflow, legacy=True)
         elif style == "instance":
-            wf_dict = self._workflow_to_dict_instance(stored, workflow=workflow, legacy=False)
+            wf_dict = self._workflow_to_dict_instance(trans, stored, workflow=workflow, legacy=False)
         elif style == "run":
             wf_dict = self._workflow_to_dict_run(trans, stored, workflow=workflow, history=history or trans.history)
         elif style == "preview":
@@ -892,13 +951,17 @@ class WorkflowContentsManager(UsesAnnotations):
             raise exceptions.RequestParameterInvalidException(f"Unknown workflow style {style}")
         if version is not None:
             wf_dict["version"] = version
+            # If returning a run-form workflow for a specific version, use that version's name
+            if style == "run":
+                wf_dict["name"] = workflow.name
         else:
             wf_dict["version"] = len(stored.workflows) - 1
         return wf_dict
 
     def _sync_stored_workflow(self, trans, stored_workflow):
-        workflow_path = stored_workflow.from_path
-        self.store_workflow_to_path(workflow_path, stored_workflow, stored_workflow.latest_workflow, trans=trans)
+        if trans.user_is_admin:
+            workflow_path = stored_workflow.from_path
+            self.store_workflow_to_path(workflow_path, stored_workflow, stored_workflow.latest_workflow, trans=trans)
 
     def store_workflow_artifacts(self, directory, filename_base, workflow, **kwd):
         modern_workflow_path = os.path.join(directory, f"{filename_base}.gxwf.yml")
@@ -1017,8 +1080,10 @@ class WorkflowContentsManager(UsesAnnotations):
             step_models.append(step_model)
         return {
             "id": trans.app.security.encode_id(stored.id),
+            "workflow_id": trans.app.security.encode_id(workflow.id),
             "history_id": trans.app.security.encode_id(history.id) if history else None,
             "name": stored.name,
+            "owner": stored.user.username,
             "steps": step_models,
             "step_version_changes": step_version_changes,
             "has_upgrade_messages": has_upgrade_messages,
@@ -1044,7 +1109,7 @@ class WorkflowContentsManager(UsesAnnotations):
                     if not isinstance(conns, list):
                         conns = [conns]
                     value_list = [
-                        "Output '%s' from Step %d." % (conn.output_name, int(conn.output_step.order_index) + 1)
+                        f"Output '{conn.output_name}' from Step {int(conn.output_step.order_index) + 1}."
                         for conn in conns
                     ]
                     value = ",".join(value_list)
@@ -1069,7 +1134,7 @@ class WorkflowContentsManager(UsesAnnotations):
                         for i in range(len(repeat_values)):
                             nested_input_dict = {}
                             index = repeat_values[i]["__index__"]
-                            nested_input_dict["title"] = "%i. %s" % (i + 1, input.title)
+                            nested_input_dict["title"] = f"{i + 1}. {input.title}"
                             try:
                                 nested_input_dict["inputs"] = do_inputs(
                                     input.inputs,
@@ -1122,6 +1187,7 @@ class WorkflowContentsManager(UsesAnnotations):
         for step in workflow.steps:
             step_dict = {}
             step_dict["order_index"] = step.order_index
+            step_dict["type"] = step.type
             if step.annotations:
                 step_dict["annotation"] = step.annotations[0].annotation
             try:
@@ -1132,6 +1198,8 @@ class WorkflowContentsManager(UsesAnnotations):
                 continue
             if step.type == "tool":
                 tool = trans.app.toolbox.get_tool(step.tool_id, step.tool_version)
+                step_dict["tool_id"] = step.tool_id
+                step_dict["tool_version"] = step.tool_version
                 step_dict["label"] = step.label or tool.name
                 step_dict["inputs"] = do_inputs(tool.inputs, step.state.inputs, "", step)
             elif step.type == "subworkflow":
@@ -1205,7 +1273,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 "workflow_outputs": [],
             }
             if tooltip:
-                step_dict["tooltip"] = module.get_tooltip(static_path=url_for("/static"))
+                step_dict["tooltip"] = module.get_tooltip(static_path="/static")
             # Connections
             input_connections = step.input_connections
             input_connections_type = {}
@@ -1252,9 +1320,9 @@ class WorkflowContentsManager(UsesAnnotations):
             step_dict["workflow_outputs"] = outputs
             if len(output_label_duplicate) > 0:
                 output_label_duplicate_string = ", ".join(output_label_duplicate)
-                upgrade_message_dict[
-                    "output_label_duplicate"
-                ] = f"Ignoring duplicate labels: {output_label_duplicate_string}."
+                upgrade_message_dict["output_label_duplicate"] = (
+                    f"Ignoring duplicate labels: {output_label_duplicate_string}."
+                )
             if upgrade_message_dict:
                 data["upgrade_messages"][step.order_index] = upgrade_message_dict
 
@@ -1382,7 +1450,7 @@ class WorkflowContentsManager(UsesAnnotations):
         If `allow_upgrade`, the workflow and sub-workflows might use updated tool versions when refactoring.
         """
         annotation_str = ""
-        tag_str = ""
+        tags_list = []
         annotation_owner = None
         if stored is not None:
             if stored.id:
@@ -1393,7 +1461,7 @@ class WorkflowContentsManager(UsesAnnotations):
                     or self.get_item_annotation_str(trans.sa_session, annotation_owner, stored)
                     or ""
                 )
-                tag_str = stored.make_tag_string_list()
+                tags_list = stored.make_tag_string_list()
             else:
                 # dry run with flushed workflow objects, just use the annotation
                 annotations = stored.annotations
@@ -1406,7 +1474,7 @@ class WorkflowContentsManager(UsesAnnotations):
         data["format-version"] = "0.1"
         data["name"] = workflow.name
         data["annotation"] = annotation_str
-        data["tags"] = tag_str
+        data["tags"] = tags_list
         if workflow.uuid is not None:
             data["uuid"] = str(workflow.uuid)
         steps: Dict[int, Dict[str, Any]] = {}
@@ -1431,8 +1499,13 @@ class WorkflowContentsManager(UsesAnnotations):
             if not annotation_str and annotation_owner:
                 annotation_str = self.get_item_annotation_str(trans.sa_session, annotation_owner, step) or ""
             content_id = module.get_content_id() if allow_upgrade else step.content_id
-            # Export differences for backward compatibility
-            tool_state = module.get_export_state()
+            try:
+                tool_state = module.get_export_state()
+            except ValueError:
+                # Fix state if necessary
+                module.check_and_update_state()
+                tool_state = module.get_export_state()
+
             # Step info
             step_dict = {
                 "id": step.order_index,
@@ -1493,12 +1566,12 @@ class WorkflowContentsManager(UsesAnnotations):
                 if name:
                     input_dicts.append({"name": name, "description": annotation_str})
             for name, val in step_state.items():
-                if isinstance(val, RuntimeValue):
+                if isinstance(val, RuntimeValue) and not isinstance(val, ConnectedValue):
                     input_dicts.append({"name": name, "description": f"runtime parameter for tool {module.get_name()}"})
                 elif isinstance(val, dict):
                     # Input type is described by a dict, e.g. indexed parameters.
                     for partval in val.values():
-                        if isinstance(partval, RuntimeValue):
+                        if isinstance(partval, RuntimeValue) and not isinstance(val, ConnectedValue):
                             input_dicts.append(
                                 {"name": name, "description": f"runtime parameter for tool {module.get_name()}"}
                             )
@@ -1584,19 +1657,19 @@ class WorkflowContentsManager(UsesAnnotations):
             steps[step.order_index] = step_dict
         return data
 
-    def _workflow_to_dict_instance(self, stored, workflow, legacy=True):
+    def _workflow_to_dict_instance(self, trans, stored, workflow, legacy=True):
         encode = self.app.security.encode_id
         sa_session = self.app.model.context
-        item = stored.to_dict(view="element", value_mapper={"id": encode})
+        item = stored.to_dict(view="element")
         item["name"] = workflow.name
-        item["url"] = url_for("workflow", id=item["id"])
+        item["url"] = trans.url_builder("workflow", id=encode(stored.id))
         item["owner"] = stored.user.username
         item["email_hash"] = md5_hash_str(stored.user.email)
         item["slug"] = stored.slug
         inputs = {}
         for step in workflow.input_steps:
             step_type = step.type
-            step_label = step.label or step.tool_inputs.get("name")
+            step_label = step.label or step.tool_inputs and step.tool_inputs.get("name")
             if step_label:
                 label = step_label
             elif step_type == "data_input":
@@ -1640,7 +1713,7 @@ class WorkflowContentsManager(UsesAnnotations):
                 del step_dict["tool_id"]
                 del step_dict["tool_version"]
                 del step_dict["tool_inputs"]
-                step_dict["workflow_id"] = encode(step.subworkflow.id)
+                step_dict["workflow_id"] = step.subworkflow.id
 
             for conn in step.input_connections:
                 step_id = step.id if legacy else step.order_index
@@ -1748,18 +1821,17 @@ class WorkflowContentsManager(UsesAnnotations):
         self.__set_default_label(step, module, step_dict.get("tool_state"))
         module.save_to_step(step, detached=dry_run)
 
-        annotation = step_dict.get("annotation")
-        if annotation:
+        if annotation := step_dict.get("annotation"):
             annotation = sanitize_html(annotation)
             sa_session = None if dry_run else trans.sa_session
             self.add_item_annotation(sa_session, trans.get_user(), step, annotation)
 
         # Stick this in the step temporarily
-        DictConnection = Dict[str, Union[int, str]]
+        DictConnection: TypeAlias = Dict[str, Union[int, str]]
         temp_input_connections: Dict[str, Union[List[DictConnection], DictConnection]] = step_dict.get(
             "input_connections", {}
         )
-        step.temp_input_connections = temp_input_connections
+        step.temp_input_connections = temp_input_connections  # type: ignore[assignment]
 
         # Create the model class for the step
         steps.append(step)
@@ -1818,10 +1890,14 @@ class WorkflowContentsManager(UsesAnnotations):
         embedded_subworkflow = step_dict.get("subworkflow", None)
         subworkflow_id = step_dict.get("content_id", None)
         if embedded_subworkflow and subworkflow_id:
-            raise Exception("Subworkflow step defines both subworkflow and content_id, only one may be specified.")
+            raise exceptions.RequestParameterInvalidException(
+                "Subworkflow step defines both subworkflow and content_id, only one may be specified."
+            )
 
         if not embedded_subworkflow and not subworkflow_id:
-            raise Exception("Subworkflow step must define either subworkflow or content_id.")
+            raise exceptions.RequestParameterInvalidException(
+                "Subworkflow step must define either subworkflow or content_id."
+            )
 
         if embedded_subworkflow:
             assert not dry_run
@@ -1857,7 +1933,7 @@ class WorkflowContentsManager(UsesAnnotations):
         for step in steps:
             # Input connections
             if step.temp_input_connections:  # populated by __module_from_dict
-                for input_name, conn_list in step.temp_input_connections.items():
+                for input_name, conn_list in step.temp_input_connections.items():  # type:ignore[unreachable]
                     if not conn_list:
                         continue
                     if not isinstance(conn_list, list):  # Older style singleton connection
@@ -1887,7 +1963,7 @@ class WorkflowContentsManager(UsesAnnotations):
         to the actual `label` attribute which is available for all module types, unique, and mapped to its own database column.
         """
         if not module.label and module.type in ["data_input", "data_collection_input"]:
-            new_state = safe_loads(state)
+            new_state = safe_loads(state) or {}
             default_label = new_state.get("name")
             if default_label and util.unicodify(default_label).lower() not in [
                 "input dataset",
@@ -1944,20 +2020,101 @@ class WorkflowContentsManager(UsesAnnotations):
                 tools.extend(self.get_all_tools(step.subworkflow))
         return tools
 
+    def get_or_create_workflow_from_trs(
+        self,
+        trans: ProvidesUserContext,
+        trs_url: Optional[str],
+        trs_id: Optional[str] = None,
+        trs_version: Optional[str] = None,
+        trs_server: Optional[str] = None,
+    ):
+        user_id = trans.user and trans.user.id
+        assert user_id, "Cannot create workflow for anonymous user"
+        if not trs_url:
+            assert trs_server and trs_id and trs_version, "trs_url or trs_server, trs_version and trs_id must be passed"
+            server = self.trs_proxy.get_server(trs_server)
+            trs_url = server.get_trs_url(trs_id, trs_version)
+        else:
+            _, trs_id, trs_version = self.trs_proxy.get_trs_id_and_version_from_trs_url(trs_url=trs_url)
+        assert trs_id and trs_version and trs_url
+
+        workflow = self.get_workflow_by_trs_id_and_version(trs_id=trs_id, trs_version=trs_version, user_id=user_id)
+        if not workflow:
+            workflow = self.create_workflow_from_trs_url(trans, trs_url, trs_server)
+        return workflow
+
+    def create_workflow_from_trs_url(
+        self, trans: ProvidesUserContext, trs_url: str, trs_server: Optional[str] = None
+    ) -> StoredWorkflow:
+        _, trs_tool_id, trs_version_id = self.trs_proxy.get_trs_id_and_version_from_trs_url(trs_url=trs_url)
+        data = self.trs_proxy.get_version_from_trs_url(trs_url)
+        as_dict = yaml.safe_load(data)
+        raw_workflow_description = self.normalize_workflow_format(trans, as_dict)
+        created_workflow = self.build_workflow_from_raw_description(
+            trans,
+            raw_workflow_description,
+            WorkflowCreateOptions(
+                trs_tool_id=trs_tool_id,
+                trs_version_id=trs_version_id,
+                trs_url=trs_url,
+                trs_server=trs_server,
+                archive_source="trs_url",
+            ),
+        )
+        return created_workflow.stored_workflow
+
+    def get_workflow_by_trs_id_and_version(
+        self, trs_id: str, trs_version: str, user_id: Optional[int] = None
+    ) -> Optional[model.StoredWorkflow]:
+        sa_session = self.app.model.session
+
+        def to_json(column, keys: List[str]):
+            assert sa_session.bind
+            if sa_session.bind.dialect.name == "postgresql":
+                cast: Union[ColumnElement[Any], Cast[Any]] = func.cast(func.convert_from(column, "UTF8"), JSONB)
+                for key in keys:
+                    cast = cast.__getitem__(key)
+                return cast.astext
+            else:
+                for key in keys:
+                    column = func.json_extract(column, f"$.{key}")
+                return column
+
+        stmnt = (
+            select(model.StoredWorkflow)
+            .join(model.Workflow, model.Workflow.id == model.StoredWorkflow.latest_workflow_id)
+            .filter(
+                and_(
+                    model.StoredWorkflow.deleted == false(),
+                    to_json(model.Workflow.source_metadata, ["trs_tool_id"]) == trs_id,
+                    to_json(model.Workflow.source_metadata, ["trs_version_id"]) == trs_version,
+                )
+            )
+        )
+        if user_id:
+            stmnt = stmnt.filter(
+                model.StoredWorkflow.user_id == user_id,
+            )
+        else:
+            stmnt = stmnt.filter(model.StoredWorkflow.importable == true())
+        return sa_session.execute(stmnt.order_by(model.StoredWorkflow.id.desc()).limit(1)).scalar()
+
 
 class RefactorRequest(RefactorActions):
     style: str = "export"
 
 
+def safe_wraps(v: Any, nxt: SerializerFunctionWrapHandler) -> str:
+    try:
+        return nxt(v)
+    except Exception:
+        return safe_dumps(v)
+
+
 class RefactorResponse(BaseModel):
     action_executions: List[RefactorActionExecution]
-    workflow: dict
+    workflow: Annotated[dict, WrapSerializer(safe_wraps, when_used="json")]
     dry_run: bool
-
-    class Config:
-        # Workflows have dictionaries with integer keys, which pydantic doesn't coerce to strings.
-        # Integer object keys aren't valid JSON, so the client fails.
-        json_dumps = safe_dumps
 
 
 class WorkflowStateResolutionOptions(BaseModel):
@@ -1997,11 +2154,11 @@ class WorkflowCreateOptions(WorkflowStateResolutionOptions):
     shed_tool_conf: Optional[str] = None
 
     # for workflows imported by archive source
-    archive_source: Optional[str] = ""
-    trs_tool_id: str = ""
-    trs_version_id: str = ""
-    trs_server: str = ""
-    trs_url: str = ""
+    archive_source: Optional[str] = None
+    trs_tool_id: Optional[str] = None
+    trs_version_id: Optional[str] = None
+    trs_server: Optional[str] = None
+    trs_url: Optional[str] = None
 
     @property
     def is_importable(self):
@@ -2075,5 +2232,5 @@ def _get_invocation(session, eager, invocation_id):
 
 
 def get_count(session, statement):
-    stmt = select(func.count()).select_from(statement)
+    stmt = select(func.count()).select_from(statement.subquery())
     return session.scalar(stmt)

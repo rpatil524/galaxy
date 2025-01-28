@@ -9,17 +9,17 @@ A sharable Galaxy object:
     can be published effectively making it available to all other Users
     can be rated
 """
+
 import logging
-import re
 from typing import (
     Any,
     List,
     Optional,
     Set,
     Type,
-    TYPE_CHECKING,
 )
 
+from slugify import slugify
 from sqlalchemy import (
     exists,
     false,
@@ -27,7 +27,10 @@ from sqlalchemy import (
     true,
 )
 
-from galaxy import exceptions
+from galaxy import (
+    exceptions,
+    model,
+)
 from galaxy.managers import (
     annotatable,
     base,
@@ -41,7 +44,6 @@ from galaxy.model import (
     User,
     UserShareAssociation,
 )
-from galaxy.model.base import transaction
 from galaxy.model.tags import GalaxyTagHandler
 from galaxy.schema.schema import (
     ShareWithExtra,
@@ -50,9 +52,6 @@ from galaxy.schema.schema import (
 from galaxy.structured_app import MinimalManagerApp
 from galaxy.util import ready_name_for_url
 from galaxy.util.hash_util import md5_hash_str
-
-if TYPE_CHECKING:
-    from sqlalchemy.orm import Query
 
 log = logging.getLogger(__name__)
 
@@ -90,16 +89,16 @@ class SharableModelManager(
         return self.list(filters=filters, **kwargs)
 
     # .... owned/accessible interfaces
-    def is_owner(self, item: "Query", user: Optional[User], **kwargs: Any) -> bool:
+    def is_owner(self, item: model.Base, user: Optional[User], **kwargs: Any) -> bool:
         """
         Return true if this sharable belongs to `user` (or `user` is an admin).
         """
         # ... effectively a good fit to have this here, but not semantically
         if self.user_manager.is_admin(user, trans=kwargs.get("trans", None)):
             return True
-        return item.user == user
+        return item.user == user  # type:ignore[attr-defined]
 
-    def is_accessible(self, item: "Query", user: Optional[User], **kwargs: Any) -> bool:
+    def is_accessible(self, item, user: Optional[User], **kwargs: Any) -> bool:
         """
         If the item is importable, is owned by `user`, or (the valid) `user`
         is in 'users shared with' list for the item: return True.
@@ -199,8 +198,7 @@ class SharableModelManager(
 
         if flush:
             session = self.session()
-            with transaction(session):
-                session.commit()
+            session.commit()
         return user_share_assoc
 
     def unshare_with(self, item, user: User, flush: bool = True):
@@ -212,8 +210,7 @@ class SharableModelManager(
         self.session().delete(user_share_assoc)
         if flush:
             session = self.session()
-            with transaction(session):
-                session.commit()
+            session.commit()
         return user_share_assoc
 
     def _query_shared_with(self, user, eagerloads=True, **kwargs):
@@ -279,8 +276,7 @@ class SharableModelManager(
 
         if flush:
             session = self.session()
-            with transaction(session):
-                session.commit()
+            session.commit()
         return current_shares, needs_adding, needs_removing
 
     # .... slugs
@@ -291,7 +287,7 @@ class SharableModelManager(
         Validate and set the new slug for `item`.
         """
         # precondition: has been validated
-        if not self.is_valid_slug(new_slug):
+        if not SlugBuilder.is_valid_slug(new_slug):
             raise exceptions.RequestParameterInvalidException("Invalid slug", slug=new_slug)
 
         if item.slug == new_slug:
@@ -305,26 +301,8 @@ class SharableModelManager(
 
         item.slug = new_slug
         if flush:
-            with transaction(session):
-                session.commit()
+            session.commit()
         return item
-
-    def is_valid_slug(self, slug):
-        """
-        Returns true if `slug` is valid.
-        """
-        VALID_SLUG_RE = re.compile(r"^[a-z0-9\-]+$")
-        return VALID_SLUG_RE.match(slug)
-
-    def _slugify(self, start_with):
-        # Replace whitespace with '-'
-        slug_base = re.sub(r"\s+", "-", start_with)
-        # Remove all non-alphanumeric characters.
-        slug_base = re.sub(r"[^a-zA-Z0-9\-]", "", slug_base)
-        # Remove trailing '-'.
-        if slug_base.endswith("-"):
-            slug_base = slug_base[:-1]
-        return slug_base
 
     def _default_slug_base(self, item):
         # override in subclasses
@@ -341,7 +319,7 @@ class SharableModelManager(
 
         # Setup slug base.
         if cur_slug is None or cur_slug == "":
-            slug_base = self._slugify(self._default_slug_base(item))
+            slug_base = slugify(self._default_slug_base(item), allow_unicode=True)
         else:
             slug_base = cur_slug
 
@@ -352,7 +330,7 @@ class SharableModelManager(
         while importable_item_slug_exists(self.session(), item.__class__, item.user, new_slug):
             # Slug taken; choose a new slug based on count. This approach can
             # handle numerous items with the same name gracefully.
-            new_slug = "%s-%i" % (slug_base, count)
+            new_slug = f"{slug_base}-{count}"
             count += 1
 
         return new_slug
@@ -365,8 +343,7 @@ class SharableModelManager(
         self.session().add(item)
         if flush:
             session = self.session()
-            with transaction(session):
-                session.commit()
+            session.commit()
         return item
 
     # TODO: def by_slug( self, user, **kwargs ):
@@ -579,6 +556,11 @@ class SlugBuilder:
         # Set slug and return.
         item.slug = new_slug
         return item.slug == cur_slug
+
+    @classmethod
+    def is_valid_slug(self, slug):
+        """Returns true if slug is valid."""
+        return slugify(slug, allow_unicode=True) == slug
 
 
 def slug_exists(session, model_class, user, slug, ignore_deleted=False):

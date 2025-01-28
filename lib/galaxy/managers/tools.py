@@ -30,7 +30,7 @@ if TYPE_CHECKING:
     from galaxy.managers.base import OrmFilterParsersType
 
 
-class DynamicToolManager(ModelManager):
+class DynamicToolManager(ModelManager[model.DynamicTool]):
     """Manages dynamic tools stored in Galaxy's database."""
 
     model_class = model.DynamicTool
@@ -110,6 +110,8 @@ class DynamicToolManager(ModelManager):
                 tool_path=tool_path,
                 tool_directory=tool_directory,
                 uuid=uuid,
+                active=tool_payload.get("active"),
+                hidden=tool_payload.get("hidden"),
                 value=representation,
             )
         self.app.toolbox.load_dynamic_tool(dynamic_tool)

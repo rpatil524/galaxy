@@ -1,16 +1,32 @@
+import reportDefault from "@/components/Workflow/Editor/reportDefault";
 import { useWorkflowCommentStore, type WorkflowComment } from "@/stores/workflowEditorCommentStore";
-import { type ConnectionOutputLink, type Steps, useWorkflowStepStore } from "@/stores/workflowStepStore";
+import { useWorkflowStateStore } from "@/stores/workflowEditorStateStore";
+import { useWorkflowEditorToolbarStore } from "@/stores/workflowEditorToolbarStore";
+import {
+    type ConnectionOutputLink,
+    type StepInputConnection,
+    type Steps,
+    useWorkflowStepStore,
+} from "@/stores/workflowStepStore";
 
-interface Workflow {
+export interface Workflow {
     name: string;
     annotation: string;
     license: string;
     creator: any;
     version: number;
-    report: any;
+    report?: any;
     steps: Steps;
     comments: WorkflowComment[];
     tags: string[];
+}
+
+export interface LoadWorkflowOptions {
+    appendData?: boolean;
+    /** if set, overwrites the append data behavior of reassigning IDs */
+    reassignIds?: boolean;
+    createConnections?: boolean;
+    defaultPosition?: { top: number; left: number };
 }
 
 /**
@@ -23,29 +39,47 @@ interface Workflow {
  */
 export async function fromSimple(
     id: string,
-    data: Workflow,
-    appendData = false,
-    defaultPosition = { top: 0, left: 0 }
+    data: Pick<Workflow, "steps" | "comments" | "report">,
+    options?: LoadWorkflowOptions
 ) {
-    const stepStore = useWorkflowStepStore(id);
+    const appendData = options?.appendData ?? false;
+    const defaultPosition = options?.defaultPosition ?? { top: 0, left: 0 };
+
     const commentStore = useWorkflowCommentStore(id);
+    const stateStore = useWorkflowStateStore(id);
+    const stepStore = useWorkflowStepStore(id);
+    const toolbarStore = useWorkflowEditorToolbarStore(id);
 
     // If workflow being copied into another, wipe UUID and let
     // Galaxy assign new ones.
-    if (appendData) {
+    if (options?.reassignIds ?? appendData) {
         const stepIdOffset = stepStore.getStepIndex + 1;
+        const stepArray = Object.values(data.steps);
 
-        Object.values(data.steps).forEach((step) => {
+        // Since we are resigning IDs based on index, ensure correct ordering
+        stepArray.sort((a, b) => a.id - b.id);
+
+        const stepIdMapOldToNew = new Map<number, number>();
+
+        stepArray.forEach((step, index) => {
+            const oldId = step.id;
+            step.id = index + stepIdOffset;
+            stepIdMapOldToNew.set(oldId, step.id);
+        });
+
+        stepArray.forEach((step) => {
             delete step.uuid;
             if (!step.position) {
                 // Should only happen for manually authored editor content,
                 // good enough for a first pass IMO.
                 step.position = { top: step.id * 100, left: step.id * 100 };
             }
-            step.id += stepIdOffset;
             step.position.left += defaultPosition.left;
             step.position.top += defaultPosition.top;
-            Object.values(step.input_connections).forEach((link) => {
+
+            const newInputConnections: StepInputConnection = {};
+
+            Object.entries(step.input_connections).forEach(([key, link]) => {
                 if (link === undefined) {
                     console.error("input connections invalid", step.input_connections);
                 } else {
@@ -55,11 +89,25 @@ export async function fromSimple(
                     } else {
                         linkArray = link;
                     }
-                    linkArray.forEach((link) => {
-                        link.id += stepIdOffset;
+
+                    const remappedLinkArray = linkArray.map((link) => {
+                        const newId = stepIdMapOldToNew.get(link.id);
+
+                        return {
+                            ...link,
+                            id: newId,
+                        };
                     });
+
+                    // id may be undefined, if the partial Workflow does not contain the step
+                    // in that case, remove the link
+                    const newLinkArray = remappedLinkArray.filter((link) => link.id) as ConnectionOutputLink[];
+
+                    newInputConnections[key] = newLinkArray;
                 }
             });
+
+            step.input_connections = newInputConnections;
         });
 
         data.comments.forEach((comment, index) => {
@@ -68,10 +116,18 @@ export async function fromSimple(
     }
 
     Object.values(data.steps).map((step) => {
-        stepStore.addStep(step);
+        stepStore.addStep(step, appendData, options?.createConnections ?? true);
     });
 
-    commentStore.addComments(data.comments, [defaultPosition.left, defaultPosition.top]);
+    commentStore.addComments(data.comments, [defaultPosition.left, defaultPosition.top], appendData);
+
+    if (!appendData) {
+        stateStore.report = data.report ?? {
+            markdown: reportDefault,
+        };
+    }
+
+    toolbarStore.currentTool = "pointer";
 }
 
 export function toSimple(id: string, workflow: Workflow): Omit<Workflow, "version"> {

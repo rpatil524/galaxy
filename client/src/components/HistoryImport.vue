@@ -1,13 +1,15 @@
 <template>
     <div class="history-import-component" aria-labelledby="history-import-heading">
-        <h1 id="history-import-heading" class="h-lg">Import a history from an archive</h1>
+        <h1 id="history-import-heading" class="h-lg">
+            Import {{ identifierText === "invocation" ? "an" : "a" }} {{ identifierText }} from an archive
+        </h1>
 
         <b-alert v-if="errorMessage" variant="danger" dismissible show @dismissed="errorMessage = null">
             {{ errorMessage }}
             <JobError
                 v-if="jobError"
                 style="margin-top: 15px"
-                header="History import job ended in error"
+                :header="`${identifierTextCapitalized} import job ended in error`"
                 :job="jobError" />
         </b-alert>
 
@@ -15,12 +17,15 @@
             <LoadingSpan message="Loading server configuration." />
         </div>
         <div v-else-if="waitingOnJob">
-            <LoadingSpan message="Waiting on history import job, this may take a while." />
+            <LoadingSpan :message="`Waiting on ${identifierText} import job, this may take a while.`" />
         </div>
         <div v-else-if="complete">
             <b-alert :show="complete" variant="success" dismissible @dismissed="complete = false">
                 <span class="mb-1 h-sm">Done!</span>
-                <p>History imported, check out <a :href="historyLink">your histories</a>.</p>
+                <p>
+                    {{ identifierTextCapitalized }} imported, check out
+                    <router-link :to="linkToList">your {{ identifierTextPlural }}</router-link>
+                </p>
             </b-alert>
         </div>
         <div v-else>
@@ -67,7 +72,7 @@
                 </b-form-group>
 
                 <b-button class="import-button" variant="primary" type="submit" :disabled="!importReady">
-                    Import history
+                    Import {{ identifierText }}
                 </b-button>
             </b-form>
         </div>
@@ -86,9 +91,10 @@ import { waitOnJob } from "components/JobStates/wait";
 import LoadingSpan from "components/LoadingSpan";
 import { getAppRoot } from "onload/loadConfig";
 import { errorMessageAsString } from "utils/simple-error";
+import { capitalizeFirstLetter } from "utils/strings";
 import Vue, { ref, watch } from "vue";
 
-import { getFileSources } from "@/api/remoteFiles";
+import { fetchFileSources } from "@/api/remoteFiles";
 
 import ExternalLink from "./ExternalLink";
 
@@ -101,6 +107,12 @@ Vue.use(BootstrapVue);
 
 export default {
     components: { FilesInput, FontAwesomeIcon, JobError, LoadingSpan, ExternalLink },
+    props: {
+        invocationImport: {
+            type: Boolean,
+            default: false,
+        },
+    },
     setup() {
         const sourceURL = ref("");
         const debouncedURL = refDebounced(sourceURL, 200);
@@ -147,8 +159,17 @@ export default {
                 return false;
             }
         },
-        historyLink() {
-            return `${getAppRoot()}histories/list`;
+        linkToList() {
+            return this.invocationImport ? `/workflows/invocations` : `/histories/list`;
+        },
+        identifierText() {
+            return this.invocationImport ? "invocation" : "history";
+        },
+        identifierTextCapitalized() {
+            return capitalizeFirstLetter(this.identifierText);
+        },
+        identifierTextPlural() {
+            return this.invocationImport ? "invocations" : "histories";
         },
     },
     watch: {
@@ -163,7 +184,7 @@ export default {
     },
     methods: {
         async initialize() {
-            const fileSources = await getFileSources();
+            const fileSources = await fetchFileSources();
             this.hasFileSources = fileSources.length > 0;
             this.initializing = false;
         },

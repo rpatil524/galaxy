@@ -15,6 +15,10 @@ tool_shed:
   # installation directory.
   #hgweb_config_dir: null
 
+  # Default URL prefix for repositories served via hgweb. If running an
+  # external hgweb server you should set this to an empty string.
+  #hgweb_repo_prefix: repos/
+
   # Allow pushing directly to mercurial repositories directly and
   # without authentication.
   #config_hg_for_dev: null
@@ -49,6 +53,9 @@ tool_shed:
   # the Tool Shed given that you specify the following two config
   # options.
   #whoosh_index_dir: database/toolshed_whoosh_indexes
+
+  # Cache directory for Pydantic model objects.
+  #model_cache_dir: database/model_cache
 
   # For searching repositories at /api/repositories:
   #repo_name_boost: 0.9

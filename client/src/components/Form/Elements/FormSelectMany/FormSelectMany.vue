@@ -39,6 +39,10 @@ const props = defineProps({
         type: Array as PropType<SelectValue | SelectValue[]>,
         default: null,
     },
+    maintainSelectionOrder: {
+        type: Boolean,
+        default: false,
+    },
 });
 
 const emit = defineEmits<{
@@ -48,6 +52,7 @@ const emit = defineEmits<{
 const searchValue = ref("");
 const useRegex = ref(false);
 const caseSensitive = ref(false);
+const localSelectionOrder = computed(() => props.maintainSelectionOrder);
 
 const searchRegex = computed(() => {
     if (useRegex.value) {
@@ -65,7 +70,13 @@ const searchRegex = computed(() => {
 /** Wraps value prop so it can be set, and always returns an array */
 const selected = computed({
     get() {
-        return Array.isArray(props.value) ? props.value : [props.value];
+        if (props.value === null) {
+            return [];
+        } else if (Array.isArray(props.value)) {
+            return props.value;
+        } else {
+            return [props.value];
+        }
     },
     set(value) {
         emit("input", value);
@@ -88,6 +99,7 @@ const { unselectedOptionsFiltered, selectedOptionsFiltered, running, moreUnselec
     selectedDisplayCount,
     unselectedDisplayCount,
     caseSensitive,
+    maintainSelectionOrder: localSelectionOrder,
 });
 
 // debounced to it doesn't blink, and only appears when relevant
@@ -118,6 +130,29 @@ function focusOptionAtIndex(selected: "selected" | "unselected", index: number) 
     }
 }
 
+/** convert array of select options to a map of select labels to select values */
+function optionsToLabelMap(options: SelectOption[]): Map<string, SelectValue> {
+    return new Map(options.map((o) => [o.label, o.value]));
+}
+
+function valuesToOptions(values: SelectValue[]): SelectOption[] {
+    function stringifyObject(value: SelectValue) {
+        return typeof value === "object" && value !== null ? JSON.stringify(value) : value;
+    }
+
+    const comparableValues = values.map(stringifyObject);
+    const valueSet = new Set(comparableValues);
+    const options: SelectOption[] = [];
+
+    props.options.forEach((option) => {
+        if (valueSet.has(stringifyObject(option.value))) {
+            options.push(option);
+        }
+    });
+
+    return options;
+}
+
 async function selectOption(event: MouseEvent, index: number): Promise<void> {
     if (event.shiftKey || event.ctrlKey) {
         handleHighlight(event, index, highlightUnselected);
@@ -142,7 +177,15 @@ async function deselectOption(event: MouseEvent, index: number) {
         const [option] = selectedOptionsFiltered.value.splice(index, 1);
 
         if (option) {
-            const i = selected.value.indexOf(option.value);
+            const i = selected.value.findIndex((selectedValue) => {
+                if (typeof selectedValue === "string") {
+                    return selectedValue === option.value;
+                } else if (typeof selectedValue === "object" && typeof option.value === "object") {
+                    // in case values are objects, compare their ids (if they have the 'id' property)
+                    return selectedValue?.id === option.value?.id;
+                }
+                return false;
+            });
             selected.value = selected.value.flatMap((value, index) => (index === i ? [] : [value]));
         }
 
@@ -154,10 +197,10 @@ async function deselectOption(event: MouseEvent, index: number) {
 function selectAll() {
     if (highlightUnselected.highlightedIndexes.length > 0) {
         const highlightedValues = highlightUnselected.highlightedOptions.map((o) => o.value);
-        const selectedSet = new Set([...selected.value, ...highlightedValues]);
-        selected.value = Array.from(selectedSet);
+        selected.value = [...selected.value, ...highlightedValues];
 
-        unselectedOptionsFiltered.value.filter((o) => highlightedValues.includes(o.value));
+        const highlightedMap = optionsToLabelMap(highlightUnselected.highlightedOptions);
+        unselectedOptionsFiltered.value.filter((o) => highlightedMap.has(o.label));
     } else if (searchValue.value === "") {
         selected.value = props.options.map((o) => o.value);
 
@@ -174,13 +217,13 @@ function selectAll() {
 
 function deselectAll() {
     if (highlightSelected.highlightedIndexes.length > 0) {
-        const selectedSet = new Set(selected.value);
-        const highlightedValues = highlightSelected.highlightedOptions.map((o) => o.value);
+        const selectedMap = optionsToLabelMap(valuesToOptions(selected.value));
+        const highlightedMap = optionsToLabelMap(highlightSelected.highlightedOptions);
 
-        highlightedValues.forEach((v) => selectedSet.delete(v));
-        selected.value = Array.from(selectedSet);
+        highlightedMap.forEach((_value, label) => selectedMap.delete(label));
+        selected.value = Array.from(selectedMap.values());
 
-        selectedOptionsFiltered.value.filter((o) => highlightedValues.includes(o.value));
+        selectedOptionsFiltered.value.filter((o) => highlightedMap.has(o.label));
     } else if (searchValue.value === "") {
         selected.value = [];
         selectedOptionsFiltered.value = [];
@@ -327,7 +370,9 @@ const selectedCount = computed(() => {
                     :class="{ highlighted: highlightUnselected.highlightedIndexes.includes(i) }"
                     @click="(e) => selectOption(e, i)"
                     @keydown="(e) => optionOnKey('unselected', e, i)">
-                    {{ option.label }}
+                    <slot name="label-area" v-bind="option">
+                        {{ option.label }}
+                    </slot>
                 </button>
 
                 <span v-if="moreUnselected" class="show-more-indicator">
@@ -359,7 +404,9 @@ const selectedCount = computed(() => {
                     :class="{ highlighted: highlightSelected.highlightedIndexes.includes(i) }"
                     @click="(e) => deselectOption(e, i)"
                     @keydown="(e) => optionOnKey('selected', e, i)">
-                    {{ option.label }}
+                    <slot name="label-area" v-bind="option">
+                        {{ option.label }}
+                    </slot>
                 </button>
 
                 <span v-if="moreSelected" class="show-more-indicator">

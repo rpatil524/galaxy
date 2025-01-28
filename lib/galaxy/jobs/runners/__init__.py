@@ -1,6 +1,7 @@
 """
 Base classes for job runner plugins.
 """
+
 import datetime
 import os
 import string
@@ -9,10 +10,17 @@ import sys
 import threading
 import time
 import traceback
-import typing
+import uuid
 from queue import (
     Empty,
     Queue,
+)
+from typing import (
+    Any,
+    Dict,
+    Optional,
+    TYPE_CHECKING,
+    Union,
 )
 
 from sqlalchemy import select
@@ -33,7 +41,7 @@ from galaxy.jobs.runners.util.job_script import (
     job_script,
     write_script,
 )
-from galaxy.model.base import transaction
+from galaxy.model.base import check_database_connection
 from galaxy.tool_util.deps.dependencies import (
     JobInfo,
     ToolInfo,
@@ -53,7 +61,7 @@ from galaxy.util.custom_logging import get_logger
 from galaxy.util.monitors import Monitors
 from .state_handler_factory import build_state_handlers
 
-if typing.TYPE_CHECKING:
+if TYPE_CHECKING:
     from galaxy.app import GalaxyManagerApplication
     from galaxy.jobs import (
         JobDestination,
@@ -118,7 +126,7 @@ class BaseJobRunner:
         self.work_threads = []
         log.debug(f"Starting {self.nworkers} {self.runner_name} workers")
         for i in range(self.nworkers):
-            worker = threading.Thread(name="%s.work_thread-%d" % (self.runner_name, i), target=self.run_next)
+            worker = threading.Thread(name=f"{self.runner_name}.work_thread-{i}", target=self.run_next)
             worker.daemon = True
             worker.start()
             self.work_threads.append(worker)
@@ -164,7 +172,7 @@ class BaseJobRunner:
                 try:
                     action_str = f"galaxy.jobs.runners.{self.__class__.__name__.lower()}.{name}"
                     action_timer = self.app.execution_timer_factory.get_timer(
-                        f"internals.{action_str}", "job runner action %s for job ${job_id} executed" % (action_str)
+                        f"internals.{action_str}", f"job runner action {action_str} for job ${{job_id}} executed"
                     )
                     method(arg)
                     log.trace(action_timer.to_str(job_id=job_id))
@@ -178,7 +186,7 @@ class BaseJobRunner:
                         # Prevent fail_job cycle in the work_queue
                         self.work_queue.put((self.fail_job, job_state))
 
-    def _ensure_db_session(self, arg: typing.Union["JobWrapper", "JobState"]) -> None:
+    def _ensure_db_session(self, arg: Union["JobWrapper", "JobState"]) -> None:
         """Ensure Job object belongs to current session."""
         try:
             job_wrapper = arg.job_wrapper  # type: ignore[union-attr]
@@ -198,9 +206,10 @@ class BaseJobRunner:
             queue_job = job_wrapper.enqueue()
         except Exception as e:
             queue_job = False
-            # Required for exceptions thrown by object store incompatiblity.
+            # Required for exceptions thrown by object store incompatibility.
             # tested by test/integration/objectstore/test_private_handling.py
-            job_wrapper.fail(str(e), exception=e)
+            message = e.client_message if hasattr(e, "client_message") else str(e)
+            job_wrapper.fail(message, exception=e)
             log.debug(f"Job [{job_wrapper.job_id}] failed to queue {put_timer}")
             return
         if queue_job:
@@ -217,8 +226,7 @@ class BaseJobRunner:
         for _ in range(len(self.work_threads)):
             self.work_queue.put((STOP_SIGNAL, None))
 
-        join_timeout = self.app.config.monitor_thread_join_timeout
-        if join_timeout > 0:
+        if (join_timeout := self.app.config.monitor_thread_join_timeout) > 0:
             log.info("Waiting up to %d seconds for job worker threads to shutdown...", join_timeout)
             start = time.time()
             # NOTE: threads that have already joined by now are not going to be logged
@@ -259,7 +267,7 @@ class BaseJobRunner:
         """
         return galaxy.jobs.JobDestination(runner=url.split(":")[0])
 
-    def parse_destination_params(self, params: typing.Dict[str, typing.Any]):
+    def parse_destination_params(self, params: Dict[str, Any]):
         """Parse the JobDestination ``params`` dict and return the runner's native representation of those params."""
         raise NotImplementedError()
 
@@ -342,8 +350,8 @@ class BaseJobRunner:
     def get_work_dir_outputs(
         self,
         job_wrapper: "MinimalJobWrapper",
-        job_working_directory: typing.Optional[str] = None,
-        tool_working_directory: typing.Optional[str] = None,
+        job_working_directory: Optional[str] = None,
+        tool_working_directory: Optional[str] = None,
     ):
         """
         Returns list of pairs (source_file, destination) describing path
@@ -375,6 +383,13 @@ class BaseJobRunner:
         job_tool = job_wrapper.tool
         for joda, dataset in self._walk_dataset_outputs(job):
             if joda and job_tool:
+                if dataset.dataset.purged:
+                    log.info(
+                        "Output dataset %s for job %s purged before job completed, skipping output collection.",
+                        joda.name,
+                        job.id,
+                    )
+                    continue
                 hda_tool_output = job_tool.find_output_def(joda.name)
                 if hda_tool_output and hda_tool_output.from_work_dir:
                     # Copy from working dir to HDA.
@@ -475,7 +490,7 @@ class BaseJobRunner:
                     env=os.environ,
                     preexec_fn=os.setpgrp,
                 )
-            log.debug("execution of external set_meta for job %d finished" % job_wrapper.job_id)
+            log.debug("execution of external set_meta for job %d finished", job_wrapper.job_id)
 
     def get_job_file(self, job_wrapper: "MinimalJobWrapper", **kwds) -> str:
         job_metrics = job_wrapper.app.job_metrics
@@ -490,6 +505,7 @@ class BaseJobRunner:
             env_setup_commands.append(env_to_statement(env))
         command_line = job_wrapper.runner_command_line
         tmp_dir_creation_statement = job_wrapper.tmp_dir_creation_statement
+        assert job_wrapper.tool
         options = dict(
             tmp_dir_creation_statement=tmp_dir_creation_statement,
             job_instrumenter=job_instrumenter,
@@ -514,10 +530,10 @@ class BaseJobRunner:
     def _find_container(
         self,
         job_wrapper: "MinimalJobWrapper",
-        compute_working_directory: typing.Optional[str] = None,
-        compute_tool_directory: typing.Optional[str] = None,
-        compute_job_directory: typing.Optional[str] = None,
-        compute_tmp_directory: typing.Optional[str] = None,
+        compute_working_directory: Optional[str] = None,
+        compute_tool_directory: Optional[str] = None,
+        compute_job_directory: Optional[str] = None,
+        compute_tmp_directory: Optional[str] = None,
     ):
         job_directory_type = "galaxy" if compute_working_directory is None else "pulsar"
         if not compute_working_directory:
@@ -526,13 +542,14 @@ class BaseJobRunner:
         if not compute_job_directory:
             compute_job_directory = job_wrapper.working_directory
 
+        tool = job_wrapper.tool
+        assert tool
         if not compute_tool_directory:
-            compute_tool_directory = job_wrapper.tool.tool_dir
+            compute_tool_directory = str(tool.tool_dir) if tool.tool_dir is not None else None
 
         if not compute_tmp_directory:
             compute_tmp_directory = job_wrapper.tmp_directory()
 
-        tool = job_wrapper.tool
         guest_ports = job_wrapper.guest_ports
         tool_info = ToolInfo(
             tool.containers,
@@ -569,7 +586,8 @@ class BaseJobRunner:
             log.exception("Caught exception in runner state handler")
 
     def fail_job(self, job_state: "JobState", exception=False, message="Job failed", full_status=None):
-        if getattr(job_state, "stop_job", True):
+        job = job_state.job_wrapper.get_job()
+        if getattr(job_state, "stop_job", True) and job.state != model.Job.states.NEW:
             self.stop_job(job_state.job_wrapper)
         job_state.job_wrapper.reclaim_ownership()
         self._handle_runner_state("failure", job_state)
@@ -586,7 +604,7 @@ class BaseJobRunner:
                 fail_message, tool_stdout=tool_stdout, tool_stderr=tool_stderr, exception=exception
             )
 
-    def mark_as_resubmitted(self, job_state: "JobState", info: typing.Optional[str] = None):
+    def mark_as_resubmitted(self, job_state: "JobState", info: Optional[str] = None):
         job_state.job_wrapper.mark_as_resubmitted(info=info)
         if not self.app.config.track_jobs_in_database:
             job_state.job_wrapper.change_state(model.Job.states.QUEUED)
@@ -613,10 +631,23 @@ class BaseJobRunner:
 
             tool_stdout_path = os.path.join(outputs_directory, "tool_stdout")
             tool_stderr_path = os.path.join(outputs_directory, "tool_stderr")
-            with open(tool_stdout_path, "rb") as stdout_file:
-                tool_stdout = self._job_io_for_db(stdout_file)
-            with open(tool_stderr_path, "rb") as stderr_file:
-                tool_stderr = self._job_io_for_db(stderr_file)
+            try:
+                with open(tool_stdout_path, "rb") as stdout_file:
+                    tool_stdout = self._job_io_for_db(stdout_file)
+                with open(tool_stderr_path, "rb") as stderr_file:
+                    tool_stderr = self._job_io_for_db(stderr_file)
+            except FileNotFoundError:
+                if job.state in (model.Job.states.DELETING, model.Job.states.DELETED):
+                    # We killed the job, so we may not even have the tool stdout / tool stderr
+                    tool_stdout = ""
+                    tool_stderr = "Job cancelled"
+                else:
+                    # Should we instead just move on ?
+                    # In the end the only consequence here is that we won't be able to determine
+                    # if the job failed for known tool reasons (check_tool_output).
+                    # OTOH I don't know if this can even be reached
+                    # Deal with it if we ever get reports about this.
+                    raise
 
             check_output_detected_state = job_wrapper.check_tool_output(
                 tool_stdout,
@@ -635,8 +666,7 @@ class BaseJobRunner:
 
             # Flush with streams...
             self.sa_session.add(job)
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
 
             if not job_ok:
                 job_runner_state = JobState.runner_states.TOOL_DETECT_ERROR
@@ -673,13 +703,18 @@ class JobState:
         self.job_wrapper = job_wrapper
         self.job_destination = job_destination
         self.runner_state = None
-        self.exit_code_file = default_exit_code_file(job_wrapper.working_directory, job_wrapper.get_id_tag())
-
         self.redact_email_in_job_name = True
+        self._exit_code_file = None
         if self.job_wrapper:
             self.redact_email_in_job_name = self.job_wrapper.app.config.redact_email_in_job_name
 
         self.cleanup_file_attributes = ["job_file", "output_file", "error_file", "exit_code_file"]
+
+    @property
+    def exit_code_file(self) -> str:
+        return self._exit_code_file or default_exit_code_file(
+            self.job_wrapper.working_directory, self.job_wrapper.get_id_tag()
+        )
 
     def set_defaults(self, files_dir):
         if self.job_wrapper is not None:
@@ -748,7 +783,7 @@ class AsynchronousJobState(JobState):
         self.output_file = output_file
         self.error_file = error_file
         if exit_code_file:
-            self.exit_code_file = exit_code_file
+            self._exit_code_file = exit_code_file
         self.job_name = job_name
 
         self.set_defaults(files_dir)
@@ -827,11 +862,19 @@ class AsynchronousJobRunner(BaseJobRunner, Monitors):
                     self.watched.append(async_job_state)
             except Empty:
                 pass
+            # Ideally we'd construct a sqlalchemy session now and pass it into `check_watched_items`
+            # and have that be the only session being used. The next best thing is to scope
+            # the session and discard it after each check_watched_item loop
+            scoped_id = str(uuid.uuid4())
+            self.app.model.set_request_id(scoped_id)
             # Iterate over the list of watched jobs and check state
             try:
+                check_database_connection(self.sa_session)
                 self.check_watched_items()
             except Exception:
                 log.exception("Unhandled exception checking active jobs")
+            finally:
+                self.app.model.unset_request_id(scoped_id)
             # Sleep a bit before the next state check
             time.sleep(self.app.config.job_runner_monitor_sleep)
 

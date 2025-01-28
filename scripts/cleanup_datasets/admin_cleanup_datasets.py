@@ -64,7 +64,6 @@ from cleanup_datasets import CleanupDatasetsApplication  # noqa: I100
 import galaxy.config
 import galaxy.model.mapping
 import galaxy.util
-from galaxy.model.base import transaction
 from galaxy.util.script import (
     app_properties_from_args,
     populate_config_args,
@@ -93,7 +92,7 @@ def main():
         help="config file (legacy, use --config instead)",
     )
     parser.add_argument("-d", "--days", dest="days", action="store", type=int, help="number of days (60)", default=60)
-    parser.add_argument("--tool_id", default=None, help="Text to match against tool_id" "Default: match all")
+    parser.add_argument("--tool_id", default=None, help="Text to match against tool_id. Default: match all")
     parser.add_argument(
         "--template",
         default=None,
@@ -121,10 +120,10 @@ def main():
         default=False,
     )
     parser.add_argument(
-        "--smtp", default=None, help="SMTP Server to use to send email. " "Default: [read from galaxy config file]"
+        "--smtp", default=None, help="SMTP Server to use to send email. Default: [read from galaxy config file]"
     )
     parser.add_argument(
-        "--fromaddr", default=None, help="From address to use to send email. " "Default: [read from galaxy config file]"
+        "--fromaddr", default=None, help="From address to use to send email. Default: [read from galaxy config file]"
     )
     populate_config_args(parser)
 
@@ -138,20 +137,18 @@ def main():
     if args.smtp is not None:
         app_properties["smtp_server"] = args.smtp
     if app_properties.get("smtp_server") is None:
-        parser.error("SMTP Server must be specified as an option (--smtp) " "or in the config file (smtp_server)")
+        parser.error("SMTP Server must be specified as an option (--smtp) or in the config file (smtp_server)")
 
     if args.fromaddr is not None:
         app_properties["email_from"] = args.fromaddr
     if app_properties.get("email_from") is None:
-        parser.error(
-            "From address must be specified as an option " "(--fromaddr) or in the config file " "(email_from)"
-        )
+        parser.error("From address must be specified as an option (--fromaddr) or in the config file (email_from)")
 
     scriptdir = os.path.dirname(os.path.abspath(__file__))
     template_file = args.template
     if template_file is None:
         default_template = os.path.join(scriptdir, "admin_cleanup_deletion_template.txt")
-        sample_template_file = "%s.sample" % default_template
+        sample_template_file = f"{default_template}.sample"
         if os.path.exists(default_template):
             template_file = default_template
         elif os.path.exists(sample_template_file):
@@ -164,7 +161,7 @@ def main():
                 "found, please specify template as an option (--template)."
             )
     elif not os.path.exists(template_file):
-        parser.error("Specified template file (%s) not found." % template_file)
+        parser.error(f"Specified template file ({template_file}) not found.")
 
     config = galaxy.config.Configuration(**app_properties)
 
@@ -173,7 +170,7 @@ def main():
     now = strftime("%Y-%m-%d %H:%M:%S")
 
     print("##########################################")
-    print("\n# %s - Handling stuff older than %i days" % (now, args.days))
+    print(f"\n# {now} - Handling stuff older than {args.days} days")
 
     if args.info_only:
         print("# Displaying info only ( --info_only )\n")
@@ -262,20 +259,18 @@ def administrative_delete_datasets(
                     # Mark the HistoryDatasetAssociation as deleted
                     hda.deleted = True
                     app.sa_session.add(hda)
-                    print("Marked HistoryDatasetAssociation id %d as " "deleted" % hda.id)
-                session = app.sa_session()
-                with transaction(session):
-                    session.commit()
+                    print(f"Marked HistoryDatasetAssociation id {hda.id} as deleted")
+                app.sa_session().commit()
 
     emailtemplate = Template(filename=template_file)
     for email, dataset_list in user_notifications.items():
         msgtext = emailtemplate.render(email=email, datasets=dataset_list, cutoff=cutoff_days)
-        subject = "Galaxy Server Cleanup " "- %d datasets DELETED" % len(dataset_list)
+        subject = f"Galaxy Server Cleanup - {len(dataset_list)} datasets DELETED"
         fromaddr = config.email_from
         print()
-        print("From: %s" % fromaddr)
-        print("To: %s" % email)
-        print("Subject: %s" % subject)
+        print(f"From: {fromaddr}")
+        print(f"To: {email}")
+        print(f"Subject: {subject}")
         print("----------")
         print(msgtext)
         if not info_only:
@@ -283,7 +278,7 @@ def administrative_delete_datasets(
 
     stop = time.time()
     print()
-    print("Marked %d dataset instances as deleted" % deleted_instance_count)
+    print(f"Marked {deleted_instance_count} dataset instances as deleted")
     print("Total elapsed time: ", stop - start)
     print("##########################################")
 

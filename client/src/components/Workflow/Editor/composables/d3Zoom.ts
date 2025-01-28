@@ -1,16 +1,29 @@
-import type { UseScrollReturn } from "@vueuse/core";
+import { type UseScrollReturn } from "@vueuse/core";
 import { select } from "d3-selection";
 import { type D3ZoomEvent, zoom, zoomIdentity } from "d3-zoom";
-import type { Ref } from "vue";
-import { ref, watch } from "vue";
+import { type Ref, ref, watch } from "vue";
 
-import type { XYPosition } from "@/stores/workflowEditorStateStore";
+import type { Vector } from "@/components/Workflow/Editor/modules/geometry";
+import { type XYPosition } from "@/stores/workflowEditorStateStore";
 
 // if element is draggable it may implement its own drag handler,
 // but d3zoom would call preventDefault
-const filter = (event: any) => {
-    const preventZoom = event.target.classList.contains("prevent-zoom");
-    return !preventZoom;
+const filter = (event: D3ZoomEvent<HTMLElement, unknown>["sourceEvent"]) => {
+    const target = event.target as HTMLElement;
+
+    if (target.classList.contains("prevent-zoom")) {
+        return false;
+    }
+
+    if (event.type === "dblclick") {
+        const style = getComputedStyle(target);
+
+        if (style.getPropertyValue("--dblclick") === "prevent") {
+            return false;
+        }
+    }
+
+    return true;
 };
 
 export function useD3Zoom(
@@ -46,10 +59,10 @@ export function useD3Zoom(
         });
     });
 
-    function setZoom(k: number) {
+    function setZoom(k: number, p?: Vector) {
         if (targetRef.value) {
             const d3Selection = select(targetRef.value).call(d3Zoom);
-            d3Zoom.scaleTo(d3Selection, k);
+            d3Zoom.scaleTo(d3Selection, k, p);
         }
     }
 
@@ -60,10 +73,10 @@ export function useD3Zoom(
         }
     }
 
-    function moveTo(coordinate: XYPosition) {
+    function moveTo(coordinate: XYPosition, p?: Vector) {
         if (targetRef.value) {
             const d3Selection = select(targetRef.value).call(d3Zoom);
-            d3Zoom.translateTo(d3Selection, coordinate.x, coordinate.y);
+            d3Zoom.translateTo(d3Selection, coordinate.x, coordinate.y, p);
         }
     }
 

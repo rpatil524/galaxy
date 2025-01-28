@@ -28,6 +28,7 @@ should annotate their dependency on the narrowest context they require.
 A method that requires a user but not a history should declare its
 ``trans`` argument as requiring type :class:`galaxy.managers.context.ProvidesUserContext`.
 """
+
 # TODO: Refactor this class so that galaxy.managers depends on a package
 # containing this.
 # TODO: Provide different classes for real users and potentially bootstrapped
@@ -38,10 +39,13 @@ import abc
 import string
 from json import dumps
 from typing import (
+    Any,
     Callable,
     cast,
+    Dict,
     List,
     Optional,
+    Tuple,
 )
 
 from sqlalchemy import select
@@ -58,10 +62,7 @@ from galaxy.model import (
     Role,
     User,
 )
-from galaxy.model.base import (
-    ModelMapping,
-    transaction,
-)
+from galaxy.model.base import ModelMapping
 from galaxy.model.scoped_session import galaxy_scoped_session
 from galaxy.model.tags import GalaxyTagHandlerSession
 from galaxy.schema.tasks import RequestUser
@@ -78,11 +79,13 @@ class ProvidesAppContext:
     Mixed in class must provide `app` property.
     """
 
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def app(self) -> MinimalManagerApp:
         """Provide access to the Galaxy ``app`` object."""
 
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def url_builder(self) -> Optional[Callable[..., str]]:
         """
         Provide access to Galaxy URLs (if available).
@@ -118,8 +121,7 @@ class ProvidesAppContext:
             except Exception:
                 action.session_id = None
             self.sa_session.add(action)
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
 
     def log_event(self, message, tool_id=None, **kwargs):
         """
@@ -150,8 +152,7 @@ class ProvidesAppContext:
             except Exception:
                 event.session_id = None
             self.sa_session.add(event)
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
 
     @property
     def sa_session(self) -> galaxy_scoped_session:
@@ -203,6 +204,13 @@ class ProvidesUserContext(ProvidesAppContext):
 
     galaxy_session: Optional[GalaxySession] = None
     _tag_handler: Optional[GalaxyTagHandlerSession] = None
+    _short_term_cache: Dict[Tuple[str, ...], Any]
+
+    def set_cache_value(self, args: Tuple[str, ...], value: Any):
+        self._short_term_cache[args] = value
+
+    def get_cache_value(self, args: Tuple[str, ...], default: Any = None) -> Any:
+        return self._short_term_cache.get(args, default)
 
     @property
     def tag_handler(self):
@@ -216,7 +224,8 @@ class ProvidesUserContext(ProvidesAppContext):
             raise AuthenticationRequired("The async task requires user authentication.")
         return RequestUser(user_id=self.user.id)
 
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def user(self):
         """Provide access to the user object."""
 
@@ -234,8 +243,7 @@ class ProvidesUserContext(ProvidesAppContext):
         return self.user is None
 
     def get_current_user_roles(self) -> List[Role]:
-        user = self.user
-        if user:
+        if user := self.user:
             roles = user.all_roles()
         else:
             roles = []
@@ -290,7 +298,8 @@ class ProvidesHistoryContext(ProvidesUserContext):
     properties.
     """
 
-    @abc.abstractproperty
+    @property
+    @abc.abstractmethod
     def history(self) -> Optional[History]:
         """Provide access to the user's current history model object.
 

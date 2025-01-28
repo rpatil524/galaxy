@@ -8,12 +8,11 @@ from sqlalchemy import (
     and_,
     select,
 )
-from sqlalchemy.orm.exc import NoResultFound
+from sqlalchemy.exc import NoResultFound
 from sqlalchemy.orm.scoping import scoped_session
 
 from galaxy.exceptions import ObjectNotFound
 from galaxy.model import StoreExportAssociation
-from galaxy.model.base import transaction
 from galaxy.schema.schema import ExportObjectType
 from galaxy.structured_app import MinimalManagerApp
 
@@ -34,8 +33,7 @@ class StoreExportTracker:
     def create_export_association(self, object_id: int, object_type: ExportObjectType) -> StoreExportAssociation:
         export_association = StoreExportAssociation(object_id=object_id, object_type=object_type)
         self.session.add(export_association)
-        with transaction(self.session):
-            self.session.commit()
+        self.session.commit()
         return export_association
 
     def set_export_association_metadata(self, export_association_id: int, export_metadata: BaseModel):
@@ -44,9 +42,8 @@ class StoreExportTracker:
             export_association: StoreExportAssociation = self.session.execute(stmt).scalars().one()
         except NoResultFound:
             raise ObjectNotFound("Cannot set export metadata. Reason: Export association not found")
-        export_association.export_metadata = export_metadata.json()
-        with transaction(self.session):
-            self.session.commit()
+        export_association.export_metadata = export_metadata.model_dump_json()  # type:ignore[assignment]
+        self.session.commit()
 
     def get_export_association(self, export_association_id: int) -> StoreExportAssociation:
         try:
@@ -64,7 +61,11 @@ class StoreExportTracker:
                 StoreExportAssociation,
             )
             .where(
-                and_(StoreExportAssociation.object_type == object_type, StoreExportAssociation.object_id == object_id)
+                and_(
+                    StoreExportAssociation.object_type == object_type,
+                    StoreExportAssociation.object_id == object_id,
+                    StoreExportAssociation.task_uuid.is_not(None),
+                )
             )
             .order_by(StoreExportAssociation.create_time.desc())
         )
@@ -72,4 +73,4 @@ class StoreExportTracker:
             stmt = stmt.offset(offset)
         if limit:
             stmt = stmt.limit(limit)
-        return self.session.execute(stmt).scalars()
+        return self.session.execute(stmt).scalars()  # type:ignore[return-value]

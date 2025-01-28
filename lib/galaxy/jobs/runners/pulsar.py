@@ -2,6 +2,7 @@
 
 More information on Pulsar can be found at https://pulsar.readthedocs.io/ .
 """
+
 import copy
 import errno
 import logging
@@ -50,11 +51,13 @@ from galaxy.jobs.runners import (
     AsynchronousJobState,
     JobState,
 )
+from galaxy.model.base import check_database_connection
 from galaxy.tool_util.deps import dependencies
 from galaxy.util import (
     galaxy_directory,
     specs,
     string_as_bool_or_none,
+    unicodify,
 )
 
 log = logging.getLogger(__name__)
@@ -320,7 +323,12 @@ class PulsarJobRunner(AsynchronousJobRunner):
 
     def _update_job_state_for_status(self, job_state, pulsar_status, full_status=None):
         log.debug("(%s) Received status update: %s", job_state.job_id, pulsar_status)
-        if pulsar_status in ["complete", "cancelled"] or job_state.job_wrapper.get_state() == model.Job.states.STOPPED:
+        if pulsar_status in ["complete", "cancelled"]:
+            self.mark_as_finished(job_state)
+            return None
+        if job_state.job_wrapper.get_state() == model.Job.states.STOPPED:
+            client = self.get_client_from_state(job_state)
+            client.kill()
             self.mark_as_finished(job_state)
             return None
         if pulsar_status in ["failed", "lost"]:
@@ -599,8 +607,7 @@ class PulsarJobRunner(AsynchronousJobRunner):
         if hasattr(job_wrapper, "task_id"):
             job_id = f"{job_id}_{job_wrapper.task_id}"
         params = job_wrapper.job_destination.params.copy()
-        user = job_wrapper.get_job().user
-        if user:
+        if user := job_wrapper.get_job().user:
             for key, value in params.items():
                 if value and isinstance(value, str):
                     params[key] = model.User.expand_user_properties(user, value)
@@ -643,8 +650,20 @@ class PulsarJobRunner(AsynchronousJobRunner):
             client = self.get_client_from_state(job_state)
             run_results = client.full_status()
             remote_metadata_directory = run_results.get("metadata_directory", None)
-            tool_stdout = run_results.get("stdout", "")
-            tool_stderr = run_results.get("stderr", "")
+            tool_stdout = unicodify(run_results.get("stdout", ""), strip_null=True)
+            tool_stderr = unicodify(run_results.get("stderr", ""), strip_null=True)
+            for file in ("tool_stdout", "tool_stderr"):
+                if tool_stdout and tool_stderr:
+                    pass
+                try:
+                    file_path = os.path.join(job_wrapper.working_directory, "outputs", file)
+                    file_content = open(file_path)
+                    if tool_stdout is None and file == "tool_stdout":
+                        tool_stdout = file_content.read()
+                    elif tool_stderr is None and file == "tool_stderr":
+                        tool_stderr = file_content.read()
+                except Exception:
+                    pass
             job_stdout = run_results.get("job_stdout")
             job_stderr = run_results.get("job_stderr")
             exit_code = run_results.get("returncode")
@@ -682,16 +701,9 @@ class PulsarJobRunner(AsynchronousJobRunner):
             ) as exit_code_file:
                 exit_code_file.write(str(exit_code))
             self._handle_metadata_externally(job_wrapper, resolve_requirements=True)
+        job_metrics_directory = os.path.join(job_wrapper.working_directory, "metadata")
         # Finish the job
         try:
-            job_metrics_directory = os.path.join(job_wrapper.working_directory, "metadata")
-            # Following check is a hack for jobs started during 19.01 or earlier release
-            # and finishing with a 19.05 code base. Eliminate the hack in 19.09 or later
-            # along with hacks for legacy metadata compute strategy.
-            if not os.path.exists(job_metrics_directory) or not any(
-                "__instrument" in f for f in os.listdir(job_metrics_directory)
-            ):
-                job_metrics_directory = job_wrapper.working_directory
             job_wrapper.finish(
                 tool_stdout,
                 tool_stderr,
@@ -703,7 +715,7 @@ class PulsarJobRunner(AsynchronousJobRunner):
             )
         except Exception:
             log.exception("Job wrapper finish method failed")
-            job_wrapper.fail("Unable to finish job", exception=True)
+            job_wrapper.fail("Unable to finish job", exception=True, job_metrics_directory=job_metrics_directory)
 
     def check_pid(self, pid):
         try:
@@ -711,11 +723,13 @@ class PulsarJobRunner(AsynchronousJobRunner):
             return True
         except OSError as e:
             if e.errno == errno.ESRCH:
-                log.debug("check_pid(): PID %d is dead" % pid)
+                log.debug("check_pid(): PID %d is dead", pid)
             else:
                 log.warning(
-                    "check_pid(): Got errno %s when attempting to check PID %d: %s"
-                    % (errno.errorcode[e.errno], pid, e.strerror)
+                    "check_pid(): Got errno %s when attempting to check PID %d: %s",
+                    errno.errorcode[e.errno],
+                    pid,
+                    e.strerror,
                 )
             return False
 
@@ -735,23 +749,27 @@ class PulsarJobRunner(AsynchronousJobRunner):
                 return
             pid = int(pid)
             if not self.check_pid(pid):
-                log.warning("stop_job(): %s: PID %d was already dead or can't be signaled" % (job.id, pid))
+                log.warning("stop_job(): %s: PID %d was already dead or can't be signaled", job.id, pid)
                 return
             for sig in [15, 9]:
                 try:
                     os.killpg(pid, sig)
                 except OSError as e:
                     log.warning(
-                        "stop_job(): %s: Got errno %s when attempting to signal %d to PID %d: %s"
-                        % (job.id, errno.errorcode[e.errno], sig, pid, e.strerror)
+                        "stop_job(): %s: Got errno %s when attempting to signal %d to PID %d: %s",
+                        job.id,
+                        errno.errorcode[e.errno],
+                        sig,
+                        pid,
+                        e.strerror,
                     )
                     return  # give up
                 sleep(2)
                 if not self.check_pid(pid):
-                    log.debug("stop_job(): %s: PID %d successfully killed with signal %d" % (job.id, pid, sig))
+                    log.debug("stop_job(): %s: PID %d successfully killed with signal %d", job.id, pid, sig)
                     return
                 else:
-                    log.warning("stop_job(): %s: PID %d refuses to die after signaling TERM/KILL" % (job.id, pid))
+                    log.warning("stop_job(): %s: PID %d refuses to die after signaling TERM/KILL", job.id, pid)
         else:
             # Remote kill
             pulsar_url = job.job_runner_name
@@ -972,11 +990,12 @@ class PulsarJobRunner(AsynchronousJobRunner):
         galaxy_job_id = None
         remote_job_id = None
         try:
+            check_database_connection(self.sa_session)
             remote_job_id = full_status["job_id"]
             if len(remote_job_id) == 32:
                 # It is a UUID - assign_ids = uuid in destination params...
-                stmt = select(model.Job).filter(model.Job.job_runner_external_id == remote_job_id)
-                galaxy_job_id = self.app.model.session.execute(stmt).scalar_one().id
+                stmt = select(model.Job.id).filter(model.Job.job_runner_external_id == remote_job_id)
+                galaxy_job_id = self.app.model.session.execute(stmt).scalar_one()
             else:
                 galaxy_job_id = remote_job_id
             job, job_wrapper = self.app.job_manager.job_handler.job_queue.job_pair_for_id(galaxy_job_id)
@@ -1014,7 +1033,7 @@ class PulsarMQJobRunner(PulsarJobRunner):
 
 
 DEFAULT_PULSAR_CONTAINER = "galaxy/pulsar-pod-staging:0.15.0.2"
-COEXECUTION_DESTENTATION_DEFAULTS = {
+COEXECUTION_DESTINATION_DEFAULTS = {
     "default_file_action": "remote_transfer",
     "rewrite_parameters": "true",
     "jobs_directory": "/pulsar_staging",
@@ -1026,7 +1045,7 @@ COEXECUTION_DESTENTATION_DEFAULTS = {
 
 
 class PulsarCoexecutionJobRunner(PulsarMQJobRunner):
-    destination_defaults = COEXECUTION_DESTENTATION_DEFAULTS
+    destination_defaults = COEXECUTION_DESTINATION_DEFAULTS
 
     def _populate_parameter_defaults(self, job_destination):
         super()._populate_parameter_defaults(job_destination)
@@ -1040,7 +1059,7 @@ class PulsarCoexecutionJobRunner(PulsarMQJobRunner):
             pulsar_app_config["staging_directory"] = params.get("jobs_directory")
 
 
-KUBERNETES_DESTINATION_DEFAULTS: Dict[str, Any] = {"k8s_enabled": True, **COEXECUTION_DESTENTATION_DEFAULTS}
+KUBERNETES_DESTINATION_DEFAULTS: Dict[str, Any] = {"k8s_enabled": True, **COEXECUTION_DESTINATION_DEFAULTS}
 
 
 class PulsarKubernetesJobRunner(PulsarCoexecutionJobRunner):
@@ -1048,14 +1067,14 @@ class PulsarKubernetesJobRunner(PulsarCoexecutionJobRunner):
     poll = True  # Poll so we can check API for pod IP for ITs.
 
 
-TES_DESTENTATION_DEFAULTS: Dict[str, Any] = {
+TES_DESTINATION_DEFAULTS: Dict[str, Any] = {
     "tes_url": PARAMETER_SPECIFICATION_REQUIRED,
-    **COEXECUTION_DESTENTATION_DEFAULTS,
+    **COEXECUTION_DESTINATION_DEFAULTS,
 }
 
 
 class PulsarTesJobRunner(PulsarCoexecutionJobRunner):
-    destination_defaults = TES_DESTENTATION_DEFAULTS
+    destination_defaults = TES_DESTINATION_DEFAULTS
 
 
 class PulsarRESTJobRunner(PulsarJobRunner):

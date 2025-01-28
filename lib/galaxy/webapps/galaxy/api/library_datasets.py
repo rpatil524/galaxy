@@ -1,4 +1,5 @@
 """API operations on the library datasets."""
+
 import glob
 import logging
 import os
@@ -25,7 +26,6 @@ from galaxy.managers import (
     library_datasets,
     roles,
 )
-from galaxy.model.base import transaction
 from galaxy.structured_app import StructuredApp
 from galaxy.tools.actions import upload_common
 from galaxy.tools.parameters import populate_state
@@ -170,7 +170,7 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
         :rtype:     dictionary
         :returns:   dict of current roles for all available permission types
         """
-        return self.ldda_manager.serialize_dataset_association_roles(trans, library_dataset)
+        return self.ldda_manager.serialize_dataset_association_roles(library_dataset)
 
     @expose_api
     def update(self, trans, encoded_dataset_id, payload=None, **kwd):
@@ -198,7 +198,8 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
         :rtype:     dictionary
         """
         library_dataset = self.ld_manager.get(trans, managers_base.decode_id(self.app, encoded_dataset_id))
-        updated = self.ld_manager.update(trans, library_dataset, payload)
+        self.ld_manager.check_modifiable(trans, library_dataset)
+        updated = self.ld_manager.update(library_dataset, payload, trans=trans)
         serialized = self.ld_manager.serialize(trans, updated)
         return serialized
 
@@ -262,8 +263,7 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
                     trans.app.security_agent.permitted_actions.DATASET_ACCESS.action, dataset, private_role
                 )
                 trans.sa_session.add(dp)
-                with transaction(trans.sa_session):
-                    trans.sa_session.commit()
+                trans.sa_session.commit()
             if not trans.app.security_agent.dataset_is_private_to_user(trans, dataset):
                 # Check again and inform the user if dataset is not private.
                 raise exceptions.InternalServerError("An error occurred and the dataset is NOT private.")
@@ -356,8 +356,7 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
             library_dataset.deleted = True
 
         trans.sa_session.add(library_dataset)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
 
         rval = trans.security.encode_all_ids(library_dataset.to_dict())
         nice_size = util.nice_size(
@@ -434,8 +433,7 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
         kwd["file_type"] = kwd.get("file_type", "auto")
         kwd["link_data_only"] = "link_to_files" if util.string_as_bool(kwd.get("link_data", False)) else "copy_files"
         kwd["tag_using_filenames"] = util.string_as_bool(kwd.get("tag_using_filenames", None))
-        encoded_folder_id = kwd.get("encoded_folder_id", None)
-        if encoded_folder_id is not None:
+        if (encoded_folder_id := kwd.get("encoded_folder_id", None)) is not None:
             folder_id = self.folder_manager.cut_and_decode(trans, encoded_folder_id)
         else:
             raise exceptions.RequestParameterMissingException("The required attribute encoded_folder_id is missing.")
@@ -486,9 +484,7 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
                     os.path.realpath(path),
                 )
                 raise exceptions.RequestParameterInvalidException("The given path is invalid.")
-            if trans.app.config.user_library_import_check_permissions and not full_path_permission_for_user(
-                full_dir, path, username
-            ):
+            if username is not None and not full_path_permission_for_user(full_dir, path, username):
                 log.error(
                     "User attempted to import a path that resolves to a path outside of their import dir: "
                     "%s -> %s and cannot be read by them.",
@@ -501,9 +497,7 @@ class LibraryDatasetsController(BaseGalaxyAPIController, UsesVisualizationMixin,
                 path, allowlist=[full_dir] + trans.app.config.user_library_import_symlink_allowlist, username=username
             ):
                 # the path is a dir and contains files that symlink outside the user dir
-                error = "User attempted to import a path that resolves to a path outside of their import dir: {} -> {}".format(
-                    path, os.path.realpath(path)
-                )
+                error = f"User attempted to import a path that resolves to a path outside of their import dir: {path} -> {os.path.realpath(path)}"
                 if trans.app.config.user_library_import_check_permissions:
                     error += " or is not readable for them."
                 log.error(error)
