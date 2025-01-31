@@ -20,8 +20,7 @@ from galaxy.model import (
     WorkflowStep,
     WorkflowStepConnection,
 )
-from galaxy.model.base import transaction
-from galaxy.tools.parameters.basic import workflow_building_modes
+from galaxy.tools.parameters.workflow_utils import workflow_building_modes
 from galaxy.workflow.refactor.schema import RefactorActionExecutionMessageTypeEnum
 from galaxy_test.base.populators import WorkflowPopulator
 from galaxy_test.base.uses_shed_api import UsesShedApi
@@ -537,6 +536,35 @@ steps:
         assert len(action_executions[0].messages) == 0
         assert self._latest_workflow.step_by_label("the_step").tool_version == "0.2"
 
+    def test_tool_version_upgrade_keeps_when_expression(self):
+        self.workflow_populator.upload_yaml_workflow(
+            """
+class: GalaxyWorkflow
+inputs:
+  the_bool:
+    type: boolean
+steps:
+  the_step:
+    tool_id: multiple_versions
+    tool_version: '0.1'
+    in:
+      when: the_bool
+    state:
+      inttest: 0
+    when: $(inputs.when)
+"""
+        )
+        assert self._latest_workflow.step_by_label("the_step").tool_version == "0.1"
+        actions: ActionsJson = [
+            {"action_type": "upgrade_tool", "step": {"label": "the_step"}},
+        ]
+        action_executions = self._refactor(actions).action_executions
+        assert len(action_executions) == 1
+        assert len(action_executions[0].messages) == 0
+        step = self._latest_workflow.step_by_label("the_step")
+        assert step.tool_version == "0.2"
+        assert step.when_expression
+
     def test_tool_version_upgrade_state_added(self):
         self.workflow_populator.upload_yaml_workflow(
             """
@@ -559,7 +587,7 @@ steps:
 
         assert len(action_executions) == 1
         messages = action_executions[0].messages
-        assert len(messages) == 1
+        assert len(messages) == 2
         message = messages[0]
         assert message.message_type == RefactorActionExecutionMessageTypeEnum.tool_state_adjustment
         assert message.order_index == 0
@@ -793,8 +821,7 @@ steps:
         # Do a bunch of checks to ensure nothing workflow related was written to the database
         # or even added to the sa_session.
         sa_session = self._app.model.session
-        with transaction(sa_session):
-            sa_session.commit()
+        sa_session.commit()
 
         sw_update_time = self._model_last_time(StoredWorkflow)
         assert sw_update_time
@@ -808,8 +835,7 @@ steps:
         wo_last_id = self._model_last_id(WorkflowOutput)
 
         response = self._refactor(actions, stored_workflow=stored_workflow, dry_run=True)
-        with transaction(sa_session):
-            sa_session.commit()
+        sa_session.commit()
         assert sw_update_time == self._model_last_time(StoredWorkflow)
         assert w_update_time == self._model_last_time(Workflow)
         assert ws_last_id == self._model_last_id(WorkflowStep)

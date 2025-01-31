@@ -4,15 +4,14 @@
  */
 import { orderBy } from "lodash";
 
-import {
-    type FilterSettings as ToolFilters,
-    type Tool,
-    type ToolSection,
-    type ToolSectionLabel,
-} from "@/stores/toolStore";
+import type { FilterSettings as ToolFilters, Tool, ToolSection, ToolSectionLabel } from "@/stores/toolStore";
 import levenshteinDistance from "@/utils/levenshtein";
 
-const TOOL_ID_KEYS = ["id", "tool_id"];
+const FILTER_KEYS = {
+    id: ["id", "tool_id"],
+    panel_section_name: ["section", "panel_section_name"],
+    labels: ["label", "labels", "tag"],
+};
 const STRING_REPLACEMENTS: string[] = [" ", "-", "\\(", "\\)", "'", ":", `"`];
 const MINIMUM_DL_LENGTH = 5; // for Demerau-Levenshtein distance
 const MINIMUM_WORD_MATCH = 2; // for word match
@@ -23,7 +22,6 @@ const UNSECTIONED_SECTION = {
     name: "Unsectioned Tools",
     description: "Tools that don't appear under any section in the unsearched panel",
 };
-const VALID_SECTION_TYPES = ["edam_operations", "edam_topics"]; // other than `default`
 
 /** These are keys used to order/sort results in `ToolSearch`.
  * The value for each is the sort order, higher number = higher rank.
@@ -39,13 +37,15 @@ export interface ToolSearchKeys {
     startsWith?: number;
     /** query contains matches `Tool.name + Tool.description` */
     combined?: number;
-    /** property matches   */
+    /** `Tool.name + Tool.description` contains at least
+     * `MINIMUM_WORD_MATCH` words from query
+     */
     wordMatch?: number;
 }
 
 interface SearchMatch {
     id: string;
-    sections: (string | undefined)[];
+    /** The order of the match, higher number = higher rank in results */
     order: number;
 }
 
@@ -158,25 +158,22 @@ export function getValidToolsInCurrentView(
     isWorkflowPanel = false,
     excludedSectionIds: string[] = []
 ) {
-    const addedToolTexts: string[] = [];
-    const toolEntries = Object.entries(toolsById).filter(([, tool]) => {
-        // filter out duplicate tools (different ids, same exact name+description)
-        // related ticket: https://github.com/galaxyproject/galaxy/issues/16145
-        const toolText = tool.name + tool.description;
-        if (addedToolTexts.includes(toolText)) {
-            return false;
-        } else {
-            addedToolTexts.push(toolText);
+    const excludeSet = new Set(excludedSectionIds);
+    const validTools: Record<string, Tool> = {};
+
+    for (const [toolId, tool] of Object.entries(toolsById)) {
+        const { panel_section_id, hidden, disabled, is_workflow_compatible } = tool;
+        if (
+            !excludeSet.has(panel_section_id) &&
+            !hidden &&
+            disabled !== true &&
+            !(isWorkflowPanel && !is_workflow_compatible)
+        ) {
+            validTools[toolId] = tool;
         }
-        // filter on non-hidden, non-disabled, and workflow compatibile (based on props.workflow)
-        return (
-            !tool.hidden &&
-            tool.disabled !== true &&
-            !(isWorkflowPanel && !tool.is_workflow_compatible) &&
-            !excludedSectionIds.includes(tool.panel_section_id || "")
-        );
-    });
-    return Object.fromEntries(toolEntries);
+    }
+
+    return validTools;
 }
 
 /** Looks in each section of `currentPanel` and filters `section.tools` on `validToolIdsInCurrentView` */
@@ -184,12 +181,16 @@ export function getValidToolsInEachSection(
     validToolIdsInCurrentView: string[],
     currentPanel: Record<string, Tool | ToolSection>
 ) {
+    // use a set for fast membership lookup
+    const idSet = new Set(validToolIdsInCurrentView);
     return Object.entries(currentPanel).map(([id, section]) => {
         const validatedSection = { ...section } as ToolSection;
-        if (validatedSection.tools && Array.isArray(validatedSection.tools)) {
+        // assign sectionTools to avoid repeated getter access
+        const sectionTools = validatedSection.tools;
+        if (sectionTools && Array.isArray(sectionTools)) {
             // filter on valid tools and panel labels in this section
-            validatedSection.tools = validatedSection.tools.filter((toolId) => {
-                if (typeof toolId === "string" && validToolIdsInCurrentView.includes(toolId)) {
+            validatedSection.tools = sectionTools.filter((toolId) => {
+                if (typeof toolId === "string" && idSet.has(toolId)) {
                     return true;
                 } else if (typeof toolId !== "string") {
                     // is a special case where there is a label within a section
@@ -263,11 +264,12 @@ export function searchToolsByKeys(
 } {
     const matchedTools: SearchMatch[] = [];
     let closestTerm = null;
-    // if user's query = "id:1234" or "tool_id:1234", only search for id
-    const id = processForId(query, TOOL_ID_KEYS);
-    if (id) {
-        query = id;
-        keys = { id: 1 };
+
+    // check if query is of the form "property:value" and then ONLY filter on that property
+    const { filteredQuery, filteredKeys } = filterOnKeys(query, FILTER_KEYS);
+    if (filteredQuery) {
+        query = filteredQuery;
+        keys = filteredKeys;
     }
 
     const queryWords = query.trim().toLowerCase().split(" ");
@@ -280,7 +282,14 @@ export function searchToolsByKeys(
                 if (key === "combined") {
                     actualValue = `${tool.name.trim()} ${tool.description.trim()}`.toLowerCase();
                 } else {
-                    actualValue = (tool[key as keyof Tool] as string)?.trim().toLowerCase();
+                    const toolVal = tool[key as keyof Tool];
+                    if (typeof toolVal === "string") {
+                        actualValue = toolVal.trim().toLowerCase();
+                    } else if (Array.isArray(toolVal)) {
+                        actualValue = toolVal.join(" ").trim().toLowerCase();
+                    } else if (typeof toolVal === "number") {
+                        actualValue = toolVal.toString().trim().toLowerCase();
+                    }
                 }
 
                 // get all (space separated) words in actualValue for tool (for DL)
@@ -305,7 +314,7 @@ export function searchToolsByKeys(
                 if (!usesDL) {
                     if (actualValue.match(queryValue)) {
                         // if string.match() returns true, matching tool found
-                        matchedTools.push({ id: tool.id, sections: getPanelSectionsForTool(tool, panelView), order });
+                        matchedTools.push({ id: tool.id, order });
                         break;
                     } else if (
                         key === "combined" &&
@@ -313,11 +322,7 @@ export function searchToolsByKeys(
                         wordMatches.length >= MINIMUM_WORD_MATCH
                     ) {
                         // we are looking at combined name+description, and there are enough word matches
-                        matchedTools.push({
-                            id: tool.id,
-                            sections: getPanelSectionsForTool(tool, panelView),
-                            order: keys.wordMatch,
-                        });
+                        matchedTools.push({ id: tool.id, order: keys.wordMatch });
                         break;
                     }
                 } else if (usesDL) {
@@ -333,11 +338,7 @@ export function searchToolsByKeys(
                         if (foundTerm && (!closestTerm || (closestTerm && foundTerm.length < closestTerm.length))) {
                             closestTerm = foundTerm;
                         }
-                        matchedTools.push({
-                            id: tool.id,
-                            sections: getPanelSectionsForTool(tool, panelView),
-                            order,
-                        });
+                        matchedTools.push({ id: tool.id, order });
                         break;
                     }
                 }
@@ -345,7 +346,7 @@ export function searchToolsByKeys(
         }
     }
     // no results with string.match(): recursive call with usesDL
-    if (!id && !usesDL && matchedTools.length == 0) {
+    if (!filteredQuery && !usesDL && matchedTools.length == 0) {
         return searchToolsByKeys(tools, keys, query, panelView, currentPanel, true);
     }
     const { idResults, resultPanel } = createSortedResultObject(matchedTools, currentPanel);
@@ -366,12 +367,11 @@ export function createSortedResultObject(
 ) {
     const idResults: string[] = [];
     // creating a sectioned results object ({section_id: [tool ids], ...}), keeping
-    // track of the best version of each tool, and also sorting by indexed order of keys
+    // track unique ids of each tool, and also sorting by indexed order of keys
     const resultPanel = orderBy(matchedTools, ["order"], ["desc"]).reduce(
         (acc: Record<string, Tool | ToolSection>, match: SearchMatch) => {
-            // we either found specific section(s) for tool, or we need to search all sections
-            const sections: (string | undefined)[] =
-                match.sections.length !== 0 ? match.sections : Object.keys(currentPanel);
+            // we need to search all sections in panel for this tool id
+            const sections = Object.keys(currentPanel);
             for (const section of sections) {
                 let toolAdded = false;
                 const existingPanelItem = section ? currentPanel[section] : undefined;
@@ -415,43 +415,6 @@ export function createSortedResultObject(
         {}
     );
     return { idResults, resultPanel };
-}
-
-/**
- * Gets the section(s) a tool belongs to for a given panelView.
- * Unless view=`default`, all other views must be of format `class:view_type`,
- * where `Tool` object has a `view_name` key containing an array of section ids.
- * e.g.: view = `ontology:edam_operations` => `Tool.edam_operations = [section ids]`.
- *
- * Therefore, this would not handle the case where view = `ontology:edam_merged`, since
- * Tool.edam_merged is not a valid key, and we would just return `[uncategorized]`.
- *
- * Just prevents looking through whole panel to find section id for tool,
- * we still end up doing that (in `createSortedResultObject`) in case we return [] here
- * @param tool
- * @param panelView
- * @returns Array of section ids
- */
-function getPanelSectionsForTool(tool: Tool, panelView: string) {
-    if (panelView === "default" && tool.panel_section_id) {
-        if (tool.panel_section_id.startsWith("tool_")) {
-            return [tool.panel_section_id.split("tool_")[1]];
-        } else {
-            return [tool.panel_section_id];
-        }
-    } else if (panelView !== "default") {
-        const sectionType = panelView.split(":")[1] as keyof Tool;
-        if (
-            sectionType &&
-            VALID_SECTION_TYPES.includes(sectionType as string) &&
-            (tool[sectionType] as string[])?.length !== 0
-        ) {
-            return tool[sectionType] as string[];
-        } else {
-            return ["uncategorized"];
-        }
-    }
-    return [];
 }
 
 /**
@@ -536,15 +499,32 @@ function sanitizeString(value: string, targets: string[] = [], substitute = "") 
 }
 
 /**
- * If the query is of the form "id:1234" (or "tool_id:1234"), return the id.
+ * If the query is of the form "property:value", return the value and keys which
+ * ONLY filter on that property.
+ * Otherwise, return null/empty object.
+ * @param query - the raw query
+ * @param keys - keys to filter for
+ */
+function filterOnKeys(query: string, keys: Record<string, string[]>) {
+    for (const key in keys) {
+        const filteredQuery = processForProperty(query, keys[key] || []);
+        if (filteredQuery) {
+            return { filteredQuery, filteredKeys: { [key]: 1 } };
+        }
+    }
+    return { filteredQuery: null, filteredKeys: {} };
+}
+
+/**
+ * If the query is of the form "property:value", return the value.
  * Otherwise, return null.
  * @param query - the raw query
- * @param keys - Optional: keys to check for (default: ["id"])
- * @returns id or null
+ * @param keys - keys to check for
+ * @returns value or null
  */
-function processForId(query: string, keys = ["id"]) {
+function processForProperty(query: string, keys: string[]) {
     for (const key of keys) {
-        if (query.includes(`${key}:`)) {
+        if (query.trim().startsWith(`${key}:`)) {
             return query.split(`${key}:`)[1]?.trim();
         }
     }

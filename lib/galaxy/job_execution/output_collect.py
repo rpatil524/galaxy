@@ -1,5 +1,6 @@
 """ Code allowing tools to define extra files associated with an output datset.
 """
+
 import logging
 import operator
 import os
@@ -23,7 +24,6 @@ from galaxy.model import (
     JobToOutputDatasetAssociation,
     LibraryDatasetDatasetAssociation,
 )
-from galaxy.model.base import transaction
 from galaxy.model.dataset_collections import builder
 from galaxy.model.dataset_collections.structure import UninitializedTree
 from galaxy.model.dataset_collections.type_description import COLLECTION_TYPE_DESCRIPTION_FACTORY
@@ -90,8 +90,7 @@ class PermissionProvider(AbstractPermissionProvider):
         return self._permissions
 
     def set_default_hda_permissions(self, primary_data):
-        permissions = self.permissions
-        if permissions is not UNSET:
+        if (permissions := self.permissions) is not UNSET:
             self._security_agent.set_all_dataset_permissions(primary_data.dataset, permissions, new=True, flush=False)
 
     def copy_dataset_permissions(self, init_from, primary_data):
@@ -184,6 +183,7 @@ def collect_dynamic_outputs(
                 name=output_collection_def.name,
                 metadata_source_name=output_collection_def.metadata_source,
                 final_job_state=job_context.final_job_state,
+                change_datatype_actions=job_context.change_datatype_actions,
             )
             collection_builder.populate()
         except Exception:
@@ -246,6 +246,10 @@ class JobContext(BaseJobContext):
         self._tag_handler = None
 
     @property
+    def change_datatype_actions(self):
+        return self.job.get_change_datatype_actions()
+
+    @property
     def tag_handler(self):
         if self._tag_handler is None:
             self._tag_handler = self.app.tag_handler.create_tag_handler_session(self.job.galaxy_session)
@@ -297,8 +301,7 @@ class JobContext(BaseJobContext):
         self.sa_session.add(obj)
 
     def flush(self):
-        with transaction(self.sa_session):
-            self.sa_session.commit()
+        self.sa_session.commit()
 
     def get_library_folder(self, destination):
         app = self.app
@@ -338,8 +341,7 @@ class JobContext(BaseJobContext):
         trans = self.work_context
         trans.app.security_agent.copy_library_permissions(trans, library_folder, ld)
         trans.sa_session.add(ld)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
 
         # Permissions must be the same on the LibraryDatasetDatasetAssociation and the associated LibraryDataset
         trans.app.security_agent.copy_library_permissions(trans, ld, ldda)
@@ -349,12 +351,10 @@ class JobContext(BaseJobContext):
         )
         library_folder.add_library_dataset(ld, genome_build=ldda.dbkey)
         trans.sa_session.add(library_folder)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
 
         trans.sa_session.add(ld)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
 
     def add_datasets_to_history(self, datasets, for_output_dataset=None):
         sa_session = self.sa_session
@@ -419,6 +419,10 @@ class SessionlessJobContext(SessionlessModelPersistenceContext, BaseJobContext):
         self.max_discovered_files = float("inf") if max_discovered_files is None else max_discovered_files
         self.discovered_file_count = 0
 
+    @property
+    def change_datatype_actions(self):
+        return self.metadata_params.get("change_datatype_actions", {})
+
     def output_collection_def(self, name):
         tool_as_dict = self.metadata_params["tool"]
         output_collection_defs = tool_as_dict["output_collections"]
@@ -475,11 +479,11 @@ def collect_primary_datasets(job_context: Union[JobContext, SessionlessJobContex
 
     # Loop through output file names, looking for generated primary
     # datasets in form specified by discover dataset patterns or in tool provided metadata.
-    primary_output_assigned = False
     new_outdata_name = None
     primary_datasets: Dict[str, Dict[str, Union[HistoryDatasetAssociation, LibraryDatasetDatasetAssociation]]] = {}
     storage_callbacks: List[Callable] = []
-    for output_index, (name, outdata) in enumerate(output.items()):
+    for name, outdata in output.items():
+        primary_output_assigned = False
         dataset_collectors = [DEFAULT_DATASET_COLLECTOR]
         output_def = job_context.output_def(name)
         if output_def is not None:
@@ -505,14 +509,15 @@ def collect_primary_datasets(job_context: Union[JobContext, SessionlessJobContex
             dbkey = fields_match.dbkey
             if dbkey == INPUT_DBKEY_TOKEN:
                 dbkey = job_context.input_dbkey
-            if filename_index == 0 and extra_file_collector.assign_primary_output and output_index == 0:
+            if filename_index == 0 and extra_file_collector.assign_primary_output:
                 new_outdata_name = fields_match.name or f"{outdata.name} ({designation})"
                 outdata.change_datatype(ext)
                 outdata.dbkey = dbkey
                 outdata.designation = designation
                 outdata.dataset.external_filename = None  # resets filename_override
                 # Move data from temp location to dataset location
-                job_context.object_store.update_from_file(outdata.dataset, file_name=filename, create=True)
+                if not outdata.dataset.purged:
+                    job_context.object_store.update_from_file(outdata.dataset, file_name=filename, create=True)
                 primary_output_assigned = True
                 continue
             if name not in primary_datasets:
@@ -545,6 +550,7 @@ def collect_primary_datasets(job_context: Union[JobContext, SessionlessJobContex
                 dataset_attributes=new_primary_datasets_attributes,
                 creating_job_id=job_context.get_job_id() if job_context else None,
                 storage_callbacks=storage_callbacks,
+                purged=outdata.dataset.purged,
             )
             # Associate new dataset with job
             job_context.add_output_dataset_association(f"__new_primary_file_{name}|{designation}__", primary_data)
@@ -554,7 +560,13 @@ def collect_primary_datasets(job_context: Union[JobContext, SessionlessJobContex
         if primary_output_assigned:
             outdata.name = new_outdata_name
             outdata.init_meta()
-            outdata.set_meta()
+            if not outdata.dataset.purged:
+                try:
+                    outdata.set_meta()
+                except Exception:
+                    # We don't want to fail here on a single "bad" discovered dataset
+                    log.debug("set meta failed for %s", outdata, exc_info=True)
+                    outdata.state = HistoryDatasetAssociation.states.FAILED_METADATA
             outdata.set_peek()
             outdata.discovered = True
             sa_session = job_context.sa_session
@@ -676,9 +688,8 @@ class DatasetCollector:
         pattern = self._pattern_for_dataset(dataset_instance)
         if self.match_relative_path and parent_paths:
             filename = os.path.join(*parent_paths, filename)
-        re_match = re.match(pattern, filename)
         match_object = None
-        if re_match:
+        if re_match := re.match(pattern, filename):
             match_object = RegexCollectedDatasetMatch(re_match, self, filename, path=path)
         return match_object
 

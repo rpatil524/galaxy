@@ -1,6 +1,7 @@
 """
 Class encapsulating the management of repositories installed into Galaxy from the Tool Shed.
 """
+
 import copy
 import logging
 import os
@@ -15,7 +16,6 @@ from typing import (
 )
 
 from galaxy import util
-from galaxy.model.base import transaction
 from galaxy.model.tool_shed_install import (
     ToolDependency,
     ToolShedRepository,
@@ -116,7 +116,7 @@ class InstalledRepositoryManager:
                 tpm=tpm,
                 repository=repository,
                 changeset_revision=repository.changeset_revision,
-                metadata_dict=repository.metadata_,
+                metadata_dict=repository.metadata_,  # type:ignore[arg-type]
             )
             repository_tools_tups = irmm.get_repository_tools_tups()
             # Reload tools into the appropriate tool panel section.
@@ -138,15 +138,14 @@ class InstalledRepositoryManager:
                 dmh = data_manager.DataManagerHandler(self.app)
                 dmh.install_data_managers(
                     self.app.config.shed_data_manager_config_file,
-                    repository.metadata_,
+                    repository.metadata_,  # type:ignore[arg-type]
                     repository.get_shed_config_dict(self.app),
                     data_manager_relative_install_dir,
                     repository,
                     repository_tools_tups,
                 )
         self.context.add(repository)
-        with transaction(self.context):
-            self.context.commit()
+        self.context.commit()
 
     def add_entry_to_installed_repository_dependencies_of_installed_repositories(
         self, repository: ToolShedRepository
@@ -170,9 +169,9 @@ class InstalledRepositoryManager:
             )
             debug_msg += "to installed_repository_dependencies_of_installed_repositories."
             log.debug(debug_msg)
-            self.installed_repository_dependencies_of_installed_repositories[
-                repository_tup
-            ] = repository_dependency_tups
+            self.installed_repository_dependencies_of_installed_repositories[repository_tup] = (
+                repository_dependency_tups
+            )
         # Use the repository_dependency_tups to add entries to the reverse dictionary
         # self.installed_dependent_repositories_of_installed_repositories.
         for required_repository_tup in repository_dependency_tups:
@@ -205,7 +204,9 @@ class InstalledRepositoryManager:
 
     def get_containing_repository_for_tool_dependency(self, tool_dependency_tup: tuple) -> ToolShedRepository:
         tool_shed_repository_id, name, version, type = tool_dependency_tup
-        return self.context.query(ToolShedRepository).get(tool_shed_repository_id)
+        repository = self.context.query(ToolShedRepository).get(tool_shed_repository_id)
+        assert repository
+        return repository
 
     def get_dependencies_for_repository(
         self,
@@ -701,8 +702,7 @@ class InstalledRepositoryManager:
         else:
             repository.status = ToolShedRepository.installation_status.DEACTIVATED
         self.context.add(repository)
-        with transaction(self.context):
-            self.context.commit()
+        self.context.commit()
         return errors
 
     def remove_entry_from_installed_repository_dependencies_of_installed_repositories(
@@ -890,8 +890,7 @@ class InstalledRepositoryManager:
                     tool_dependency.status = ToolDependency.installation_status.UNINSTALLED
                     tool_dependency.error_message = None
                     context.add(tool_dependency)
-                    with transaction(context):
-                        context.commit()
+                    context.commit()
                     new_tool_dependency = tool_dependency
                 else:
                     # We have no new tool dependency definition based on a matching dependency name, so remove
@@ -903,6 +902,5 @@ class InstalledRepositoryManager:
                         tool_dependency.name,
                     )
                     context.delete(tool_dependency)
-                    with transaction(context):
-                        context.commit()
+                    context.commit()
         return new_tool_dependency

@@ -10,7 +10,9 @@ import { PiniaVuePlugin } from "pinia";
 import { fromEventPattern, timer } from "rxjs";
 import { debounceTime, take, takeUntil } from "rxjs/operators";
 import _l from "utils/localization";
-import Vuex from "vuex";
+
+import _short from "@/components/plugins/short";
+import VueRouter from "vue-router";
 
 const defaultComparator = (a, b) => a == b;
 
@@ -184,7 +186,6 @@ export function getLocalVue(instrumentLocalization = false) {
         bind() {},
     };
     localVue.use(PiniaVuePlugin);
-    localVue.use(Vuex);
     localVue.use(BootstrapVue);
     const l = instrumentLocalization ? testLocalize : _l;
     localVue.use(localizationPlugin, l);
@@ -262,4 +263,38 @@ export function mockModule(storeModule, state = {}) {
         actions,
         namespaced: true,
     };
+}
+
+/**
+ * Expect and mock out an API request to /api/configuration. In general, useConfig
+ * and using tests/jest/mockConfig is better since components since be talking to the API
+ * directly in this way but some older components are not using the latest composables.
+ */
+export function expectConfigurationRequest(http, config) {
+    return http.get("/api/configuration", ({ response }) => {
+        return response(200).json(config);
+    });
+}
+
+/**
+ * Return a new mocked out router attached the specified localVue instance.
+ */
+export function injectTestRouter(localVue) {
+    localVue.use(VueRouter);
+    const router = new VueRouter();
+    return router;
+}
+
+export function suppressDebugConsole() {
+    jest.spyOn(console, "debug").mockImplementation(jest.fn());
+}
+
+export function suppressBootstrapVueWarnings() {
+    jest.spyOn(console, "warn").mockImplementation(
+        jest.fn((msg) => {
+            if (msg.indexOf("BootstrapVue warn") < 0) {
+                console.warn(msg);
+            }
+        })
+    );
 }

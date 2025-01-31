@@ -34,7 +34,6 @@ from galaxy.managers.hdas import (
 from galaxy.managers.hdcas import write_dataset_collection
 from galaxy.managers.histories import HistoryManager
 from galaxy.managers.lddas import LDDAManager
-from galaxy.model.base import transaction
 from galaxy.model.dataset_collections import builder
 from galaxy.model.dataset_collections.matching import MatchingCollections
 from galaxy.model.dataset_collections.registry import DATASET_COLLECTION_TYPES_REGISTRY
@@ -43,11 +42,11 @@ from galaxy.model.mapping import GalaxyModelMapping
 from galaxy.schema.schema import DatasetCollectionInstanceType
 from galaxy.schema.tasks import PrepareDatasetCollectionDownload
 from galaxy.security.idencoding import IdEncodingHelper
-from galaxy.util import validation
-from galaxy.web.short_term_storage import (
+from galaxy.short_term_storage import (
     ShortTermStorageMonitor,
     storage_context,
 )
+from galaxy.util import validation
 
 log = logging.getLogger(__name__)
 
@@ -95,7 +94,7 @@ class DatasetCollectionManager:
         # TODO: prebuild all required HIDs and send them in so no need to flush in between.
         dataset_collection = self.precreate_dataset_collection(
             structure,
-            allow_unitialized_element=implicit_output_name is not None,
+            allow_uninitialized_element=implicit_output_name is not None,
             completed_collection=completed_collection,
             implicit_output_name=implicit_output_name,
         )
@@ -112,10 +111,10 @@ class DatasetCollectionManager:
         return instance
 
     def precreate_dataset_collection(
-        self, structure, allow_unitialized_element=True, completed_collection=None, implicit_output_name=None
+        self, structure, allow_uninitialized_element=True, completed_collection=None, implicit_output_name=None
     ):
         has_structure = not structure.is_leaf and structure.children_known
-        if not has_structure and allow_unitialized_element:
+        if not has_structure and allow_uninitialized_element:
             dataset_collection = model.DatasetCollectionElement.UNINITIALIZED_ELEMENT
         elif not has_structure:
             collection_type_description = structure.collection_type_description
@@ -143,7 +142,7 @@ class DatasetCollectionManager:
                         element = model.DatasetCollectionElement.UNINITIALIZED_ELEMENT
                     else:
                         element = self.precreate_dataset_collection(
-                            substructure, allow_unitialized_element=allow_unitialized_element
+                            substructure, allow_uninitialized_element=allow_uninitialized_element
                         )
 
                 element = model.DatasetCollectionElement(
@@ -249,7 +248,7 @@ class DatasetCollectionManager:
             if implicit_output_name:
                 dataset_collection_instance.implicit_output_name = implicit_output_name
 
-            log.debug("Created collection with %d elements" % (len(dataset_collection_instance.collection.elements)))
+            log.debug("Created collection with %d elements", len(dataset_collection_instance.collection.elements))
 
             if set_hid:
                 parent.add_dataset_collection(dataset_collection_instance)
@@ -350,7 +349,7 @@ class DatasetCollectionManager:
                 suitable_converters = suitable_converters.intersection(set_of_new_converters)
                 if suitable_converters:
                     most_recent_datatype = datatype
-        suitable_tool_ids = list()
+        suitable_tool_ids = []
         for tool in suitable_converters:
             tool_info = {
                 "tool_id": tool[1].id,
@@ -430,8 +429,7 @@ class DatasetCollectionManager:
                 if purge and not dataset.purged:
                     async_result = self.hda_manager.purge(dataset, user=trans.user)
 
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return async_result
 
     def update(self, trans: ProvidesHistoryContext, instance_type, id, payload):
@@ -474,8 +472,7 @@ class DatasetCollectionManager:
         new_hdca.copy_tags_from(target_user=trans.get_user(), source=source_hdca)
         if not copy_elements:
             parent.add_dataset_collection(new_hdca)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return new_hdca
 
     def _set_from_dict(self, trans: ProvidesUserContext, dataset_collection_instance, new_data):
@@ -501,8 +498,7 @@ class DatasetCollectionManager:
             )
 
         if changed.keys():
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
 
         # set client tag field response after the flush
         if new_tags is not None:
@@ -530,11 +526,10 @@ class DatasetCollectionManager:
         return collections
 
     def __persist(self, dataset_collection_instance, flush=True):
-        context = self.model.context
-        context.add(dataset_collection_instance)
+        session = self.model.session
+        session.add(dataset_collection_instance)
         if flush:
-            with transaction(context):
-                context.commit()
+            session.commit()
         return dataset_collection_instance
 
     def __recursively_create_collections_for_identifiers(
@@ -615,9 +610,9 @@ class DatasetCollectionManager:
         if "__object__" in element_identifier:
             the_object = element_identifier["__object__"]
             if the_object is not None and the_object.id:
-                context = self.model.context
-                if the_object not in context:
-                    the_object = context.get(type(the_object), the_object.id)
+                session = self.model.session
+                if the_object not in session:
+                    the_object = session.get(type(the_object), the_object.id)
             return the_object
 
         # dataset_identifier is dict {src=hda|ldda|hdca|new_collection, id=<encoded_id>}
@@ -631,9 +626,8 @@ class DatasetCollectionManager:
             message = message_template % element_identifier
             raise RequestParameterInvalidException(message)
 
-        tags = element_identifier.pop("tags", None)
         tag_str = ""
-        if tags:
+        if tags := element_identifier.pop("tags", None):
             tag_str = ",".join(str(_) for _ in tags)
         if src_type == "hda":
             hda = self.hda_manager.get_accessible(element_id, trans.user)
@@ -672,14 +666,12 @@ class DatasetCollectionManager:
     @overload
     def get_dataset_collection_instance(
         self, trans: ProvidesHistoryContext, instance_type: Literal["history"], id, **kwds: Any
-    ) -> model.HistoryDatasetCollectionAssociation:
-        ...
+    ) -> model.HistoryDatasetCollectionAssociation: ...
 
     @overload
     def get_dataset_collection_instance(
         self, trans: ProvidesHistoryContext, instance_type: Literal["library"], id, **kwds: Any
-    ) -> model.LibraryDatasetCollectionAssociation:
-        ...
+    ) -> model.LibraryDatasetCollectionAssociation: ...
 
     def get_dataset_collection_instance(
         self, trans: ProvidesHistoryContext, instance_type: DatasetCollectionInstanceType, id, **kwds: Any
@@ -842,7 +834,7 @@ class DatasetCollectionManager:
     def _get_collection_contents_qry(self, parent_id, limit=None, offset=None):
         """Build query to find first level of collection contents by containing collection parent_id"""
         DCE = model.DatasetCollectionElement
-        qry = Query(DCE).filter(DCE.dataset_collection_id == parent_id)
+        qry = Query(DCE).filter(DCE.dataset_collection_id == parent_id)  # type:ignore[var-annotated]
         qry = qry.order_by(DCE.element_index)
         qry = qry.options(
             joinedload(model.DatasetCollectionElement.child_collection), joinedload(model.DatasetCollectionElement.hda)

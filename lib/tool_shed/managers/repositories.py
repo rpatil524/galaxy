@@ -1,6 +1,7 @@
 """
 Manager and Serializer for TS repositories.
 """
+
 import json
 import logging
 from collections import namedtuple
@@ -204,12 +205,13 @@ def guid_to_repository(app: ToolShedApp, tool_id: str) -> "Repository":
 
 def index_tool_ids(app: ToolShedApp, tool_ids: List[str]) -> Dict[str, Any]:
     repository_found = []
-    all_metadata = dict()
+    all_metadata = {}
     for tool_id in tool_ids:
         repository = guid_to_repository(app, tool_id)
         owner = repository.user.username
         name = repository.name
-        repository = _get_repository_by_name_and_owner(app.model.context.current, name, owner, app.model.User)
+        assert name
+        repository = _get_repository_by_name_and_owner(app.model.session().current, name, owner, app.model.User)
         if not repository:
             log.warning(f"Repository {owner}/{name} does not exist, skipping")
             continue
@@ -221,7 +223,7 @@ def index_tool_ids(app: ToolShedApp, tool_ids: List[str]) -> Dict[str, Any]:
                 continue
             for tool_metadata in tools:
                 if tool_metadata["guid"] in tool_ids:
-                    repository_found.append("%d:%s" % (int(changeset), changehash))
+                    repository_found.append(f"{int(changeset)}:{changehash}")
             metadata = get_current_repository_metadata_for_changeset_revision(app, repository, changehash)
             if metadata is None:
                 continue
@@ -271,8 +273,7 @@ def get_repository_metadata_for_management(
     trans: ProvidesUserContext, encoded_repository_id: str, changeset_revision: str
 ) -> RepositoryMetadata:
     repository = get_repository_in_tool_shed(trans.app, encoded_repository_id)
-    if not can_manage_repo(trans, repository):
-        raise InsufficientPermissionsException("Cannot manage target repository")
+    ensure_can_manage(trans, repository, "Cannot manage target repository")
     revisions = [r for r in repository.metadata_revisions if r.changeset_revision == changeset_revision]
     if len(revisions) != 1:
         raise ObjectNotFound()
@@ -384,7 +385,9 @@ def get_repository_metadata_dict(app: ToolShedApp, id: str, recursive: bool, dow
         metadata_dict = metadata.to_dict(
             value_mapper={"id": app.security.encode_id, "repository_id": app.security.encode_id}
         )
-        metadata_dict["repository"] = repository.to_dict(value_mapper={"id": app.security.encode_id})
+        metadata_dict["repository"] = repository.to_dict(
+            value_mapper={"id": app.security.encode_id, "user_id": app.security.encode_id}
+        )
         if metadata.has_repository_dependencies and recursive:
             metadata_dict["repository_dependencies"] = get_all_dependencies(
                 app, metadata, processed_dependency_links=[]
@@ -458,8 +461,7 @@ def create_repository(trans: ProvidesUserContext, request: CreateRepositoryReque
     assert user
     category_ids = listify(request.category_ids)
     name = request.name
-    invalid_message = validate_repository_name(app, name, user)
-    if invalid_message:
+    if invalid_message := validate_repository_name(app, name, user):
         raise RequestParameterInvalidException(invalid_message)
 
     repo, _ = low_level_create_repository(
@@ -468,7 +470,7 @@ def create_repository(trans: ProvidesUserContext, request: CreateRepositoryReque
         type=request.type_,
         description=request.synopsis,
         long_description=request.description,
-        user_id=user.id,
+        user=user,
         category_ids=category_ids,
         remote_repository_url=request.remote_repository_url,
         homepage_url=request.homepage_url,
@@ -525,6 +527,7 @@ def upload_tar_and_set_metadata(
     app = trans.app
     user = trans.user
     assert user
+    assert user.username
     repo_dir = repository.repo_path(app)
     tip = repository.tip()
     tar_response = upload_tar(
@@ -576,6 +579,12 @@ def upload_tar_and_set_metadata(
     else:
         raise InternalServerError(message)
     return message
+
+
+def ensure_can_manage(trans: ProvidesUserContext, repository: Repository, error_message: Optional[str] = None) -> None:
+    if not can_manage_repo(trans, repository):
+        error_message = error_message or "You do not have permission to update this repository."
+        raise InsufficientPermissionsException(error_message)
 
 
 def _get_repository_by_name_and_owner(session: scoped_session, name: str, owner: str, user_model):

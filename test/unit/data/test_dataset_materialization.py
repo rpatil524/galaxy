@@ -10,7 +10,6 @@ from galaxy.model import (
     LibraryDatasetDatasetAssociation,
     store,
 )
-from galaxy.model.base import transaction
 from galaxy.model.deferred import (
     materialize_collection_instance,
     materializer_factory,
@@ -34,8 +33,7 @@ def test_undeferred_hdas_untouched(tmpdir):
     hda_fh = tmpdir.join("file.txt")
     hda_fh.write("Moo Cow")
     hda = _create_hda(sa_session, app.object_store, history, hda_fh, include_metadata_file=False)
-    with transaction(sa_session):
-        sa_session.commit()
+    sa_session.commit()
 
     materializer = materializer_factory(True, object_store=app.object_store)
     assert materializer.ensure_materialized(hda) == hda
@@ -60,6 +58,69 @@ def test_deferred_hdas_basic_attached():
     assert path
     _assert_path_contains_2_bed(path)
     _assert_2_bed_metadata(materialized_hda)
+
+
+def test_hash_validate():
+    fixture_context = setup_fixture_context_with_history()
+    store_dict = deferred_hda_model_store_dict()
+    perform_import_from_store_dict(fixture_context, store_dict)
+    deferred_hda = fixture_context.history.datasets[0]
+    assert deferred_hda
+    _assert_2_bed_metadata(deferred_hda)
+    assert deferred_hda.dataset.state == "deferred"
+    materializer = materializer_factory(True, object_store=fixture_context.app.object_store)
+    materialized_hda = materializer.ensure_materialized(deferred_hda)
+    materialized_dataset = materialized_hda.dataset
+    assert materialized_dataset.state == "ok"
+
+
+def test_hash_invalid():
+    fixture_context = setup_fixture_context_with_history()
+    store_dict = deferred_hda_model_store_dict()
+    store_dict["datasets"][0]["file_metadata"]["hashes"][0]["hash_value"] = "invalidhash"
+    perform_import_from_store_dict(fixture_context, store_dict)
+    deferred_hda = fixture_context.history.datasets[0]
+    assert deferred_hda
+    _assert_2_bed_metadata(deferred_hda)
+    assert deferred_hda.dataset.state == "deferred"
+    materializer = materializer_factory(True, object_store=fixture_context.app.object_store)
+    materialized_hda = materializer.ensure_materialized(deferred_hda)
+    materialized_dataset = materialized_hda.dataset
+    assert materialized_dataset.state == "error"
+
+
+def test_hash_validate_source_of_download():
+    fixture_context = setup_fixture_context_with_history()
+    store_dict = deferred_hda_model_store_dict()
+    store_dict["datasets"][0]["file_metadata"]["sources"][0]["hashes"] = [
+        {"model_class": "DatasetSourceHash", "hash_function": "MD5", "hash_value": "f568c29421792b1b1df4474dafae01f1"}
+    ]
+    perform_import_from_store_dict(fixture_context, store_dict)
+    deferred_hda = fixture_context.history.datasets[0]
+    assert deferred_hda
+    _assert_2_bed_metadata(deferred_hda)
+    assert deferred_hda.dataset.state == "deferred"
+    materializer = materializer_factory(True, object_store=fixture_context.app.object_store)
+    materialized_hda = materializer.ensure_materialized(deferred_hda)
+    materialized_dataset = materialized_hda.dataset
+    assert materialized_dataset.state == "ok", materialized_hda.info
+
+
+def test_hash_invalid_source_of_download():
+    fixture_context = setup_fixture_context_with_history()
+    store_dict = deferred_hda_model_store_dict()
+    store_dict["datasets"][0]["file_metadata"]["sources"][0]["hashes"] = [
+        {"model_class": "DatasetSourceHash", "hash_function": "MD5", "hash_value": "invalidhash"}
+    ]
+    perform_import_from_store_dict(fixture_context, store_dict)
+    deferred_hda = fixture_context.history.datasets[0]
+    assert deferred_hda
+    _assert_2_bed_metadata(deferred_hda)
+    assert deferred_hda.dataset.state == "deferred"
+    materializer = materializer_factory(True, object_store=fixture_context.app.object_store)
+    materialized_hda = materializer.ensure_materialized(deferred_hda)
+    materialized_dataset = materialized_hda.dataset
+    assert materialized_dataset.state == "error", materialized_hda.info
 
 
 def test_deferred_hdas_basic_attached_store_by_uuid():
@@ -134,7 +195,7 @@ def test_deferred_hdas_basic_attached_from_detached_hda():
 
     assert deferred_hda.dataset.state == "deferred"
     materializer = materializer_factory(
-        True, object_store=fixture_context.app.object_store, sa_session=fixture_context.sa_session
+        True, object_store=fixture_context.app.object_store, sa_session=fixture_context.sa_session()
     )
     materialized_hda = materializer.ensure_materialized(deferred_hda)
     materialized_dataset = materialized_hda.dataset
@@ -302,8 +363,7 @@ def _test_hdca(
     )
     sa_session.add(hdca)
     sa_session.add(collection)
-    with transaction(sa_session):
-        sa_session.commit()
+    sa_session.commit()
     return hdca
 
 
@@ -311,6 +371,7 @@ def _deferred_element_count(dataset_collection: DatasetCollection) -> int:
     count = 0
     for element in dataset_collection.elements:
         if element.is_collection:
+            assert element.child_collection
             count += _deferred_element_count(element.child_collection)
         else:
             dataset_instance = element.dataset_instance

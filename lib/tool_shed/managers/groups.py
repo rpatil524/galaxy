@@ -1,6 +1,7 @@
 """
 Manager and Serializer for TS groups.
 """
+
 import logging
 
 from sqlalchemy import (
@@ -8,7 +9,7 @@ from sqlalchemy import (
     select,
     true,
 )
-from sqlalchemy.orm.exc import (
+from sqlalchemy.exc import (
     MultipleResultsFound,
     NoResultFound,
 )
@@ -21,7 +22,6 @@ from galaxy.exceptions import (
     ObjectNotFound,
     RequestParameterInvalidException,
 )
-from galaxy.model.base import transaction
 
 log = logging.getLogger(__name__)
 
@@ -73,8 +73,7 @@ class GroupManager:
             # TODO add description field to the model
             group = trans.app.model.Group(name=name)
             trans.sa_session.add(group)
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
             return group
 
     def update(self, trans, group, name=None, description=None):
@@ -94,8 +93,7 @@ class GroupManager:
             changed = True
         if changed:
             trans.sa_session.add(group)
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
         return group
 
     def delete(self, trans, group, undelete=False):
@@ -109,8 +107,7 @@ class GroupManager:
         else:
             group.deleted = True
         trans.sa_session.add(group)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return group
 
     def list(self, trans, deleted=False):

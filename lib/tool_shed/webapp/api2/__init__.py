@@ -29,7 +29,6 @@ from starlette_context import context as request_context
 from galaxy.exceptions import AdminRequiredException
 from galaxy.managers.session import GalaxySessionManager
 from galaxy.managers.users import UserManager
-from galaxy.model.base import transaction
 from galaxy.security.idencoding import IdEncodingHelper
 from galaxy.util import unicodify
 from galaxy.web.framework.decorators import require_admin_message
@@ -81,7 +80,7 @@ api_key_cookie = APIKeyCookie(name=AUTH_COOKIE_NAME, auto_error=False)
 
 
 def depends(dep_type: Type[T]) -> T:
-    return framework_depends(dep_type, get_app=get_app)
+    return framework_depends(dep_type, app=get_app_with_request_session)
 
 
 def get_api_user(
@@ -291,7 +290,6 @@ def ensure_valid_session(trans: SessionRequestContext) -> None:
     sa_session = app.model.context
     request = trans.request
     # Try to load an existing session
-    secure_id = request.get_cookie(AUTH_COOKIE_NAME)
     galaxy_session = None
     prev_galaxy_session = None
     user_for_new_session = None
@@ -299,7 +297,7 @@ def ensure_valid_session(trans: SessionRequestContext) -> None:
     # Track whether the session has changed so we can avoid calling flush
     # in the most common case (session exists and is valid).
     galaxy_session_requires_flush = False
-    if secure_id:
+    if secure_id := request.get_cookie(AUTH_COOKIE_NAME):
         session_key: Optional[str] = app.security.decode_guid(secure_id)
         if session_key:
             # We do NOT catch exceptions here, if the database is down the request should fail,
@@ -332,8 +330,7 @@ def ensure_valid_session(trans: SessionRequestContext) -> None:
         #        be needed.
         if prev_galaxy_session:
             sa_session.add(prev_galaxy_session)
-        with transaction(sa_session):
-            sa_session.commit()
+        sa_session.commit()
 
 
 def set_auth_cookie(trans: SessionRequestContext, session):

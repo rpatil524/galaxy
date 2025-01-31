@@ -166,7 +166,7 @@ def initialize_fast_app(gx_webapp, tool_shed_app):
     app = get_fastapi_instance()
     add_exception_handler(app)
     add_request_id_middleware(app)
-    from .buildapp import SHED_API_VERSION
+    from .config import SHED_API_VERSION
 
     def mount_static(directory: Path):
         name = directory.name
@@ -193,7 +193,8 @@ def initialize_fast_app(gx_webapp, tool_shed_app):
     include_all_package_routers(app, routes_package)
     wsgi_handler = WSGIMiddleware(gx_webapp)
     tool_shed_app.haltables.append(("WSGI Middleware threadpool", wsgi_handler.executor.shutdown))
-    app.mount("/", wsgi_handler)
+    # https://github.com/abersheeran/a2wsgi/issues/44
+    app.mount("/", wsgi_handler)  # type: ignore[arg-type]
     return app
 
 

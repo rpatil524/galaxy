@@ -4,6 +4,7 @@ Utilities for validating inputs related to user objects.
 The validate_* methods in this file return simple messages that do not contain
 user inputs - so these methods do not need to be escaped.
 """
+
 import logging
 import re
 from typing import Optional
@@ -49,13 +50,13 @@ def validate_email_str(email):
     if not (VALID_EMAIL_RE.match(email)):
         return "The format of the email address is not correct."
     elif len(email) > EMAIL_MAX_LEN:
-        return "Email address cannot be more than %d characters in length." % EMAIL_MAX_LEN
+        return f"Email address cannot be more than {EMAIL_MAX_LEN} characters in length."
     return ""
 
 
 def validate_password_str(password):
     if not password or len(password) < PASSWORD_MIN_LEN:
-        return "Use a password of at least %d characters." % PASSWORD_MIN_LEN
+        return f"Use a password of at least {PASSWORD_MIN_LEN} characters."
     return ""
 
 
@@ -64,7 +65,7 @@ def validate_publicname_str(publicname):
     if not publicname:
         return "Public name cannot be empty"
     if len(publicname) > PUBLICNAME_MAX_LEN:
-        return "Public name cannot be more than %d characters in length." % (PUBLICNAME_MAX_LEN)
+        return f"Public name cannot be more than {PUBLICNAME_MAX_LEN} characters in length."
     if not (VALID_PUBLICNAME_RE.match(publicname)):
         return "Public name must contain only lower-case letters, numbers, '.', '_' and '-'."
     return ""
@@ -129,8 +130,7 @@ def validate_publicname(trans, publicname, user=None):
     """
     if user and user.username == publicname:
         return ""
-    message = validate_publicname_str(publicname)
-    if message:
+    if message := validate_publicname_str(publicname):
         return message
 
     stmt = select(trans.app.model.User).filter_by(username=publicname).limit(1)
@@ -160,10 +160,7 @@ def validate_password(trans, password, confirm):
     return validate_password_str(password)
 
 
-def validate_preferred_object_store_id(object_store: ObjectStore, preferred_object_store_id: Optional[str]) -> str:
-    if not object_store.object_store_allows_id_selection() and preferred_object_store_id is not None:
-        return "The current configuration doesn't allow selecting preferred object stores."
-    if object_store.object_store_allows_id_selection() and preferred_object_store_id:
-        if preferred_object_store_id not in object_store.object_store_ids_allowing_selection():
-            return "Supplied object store id is not an allowed object store selection"
-    return ""
+def validate_preferred_object_store_id(
+    trans, object_store: ObjectStore, preferred_object_store_id: Optional[str]
+) -> str:
+    return object_store.validate_selected_object_store_id(trans.user, preferred_object_store_id) or ""

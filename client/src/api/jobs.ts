@@ -1,4 +1,9 @@
-import { fetcher } from "@/api/schema";
+import { type components } from "@/api/schema";
 
-export const jobLockStatus = fetcher.path("/api/job_lock").method("get").create();
-export const jobLockUpdate = fetcher.path("/api/job_lock").method("put").create();
+export type JobDestinationParams = components["schemas"]["JobDestinationParams"];
+export type ShowFullJobResponse = components["schemas"]["ShowFullJobResponse"];
+export type JobBaseModel = components["schemas"]["JobBaseModel"];
+export type JobDetails = components["schemas"]["ShowFullJobResponse"] | components["schemas"]["EncodedJobDetails"];
+export type JobInputSummary = components["schemas"]["JobInputSummary"];
+export type JobDisplayParametersSummary = components["schemas"]["JobDisplayParametersSummary"];
+export type JobMetric = components["schemas"]["JobMetric"];

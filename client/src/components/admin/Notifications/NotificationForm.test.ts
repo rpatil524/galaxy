@@ -3,11 +3,15 @@ import { getLocalVue } from "@tests/jest/helpers";
 import { mount, type Wrapper } from "@vue/test-utils";
 import flushPromises from "flush-promises";
 import { setActivePinia } from "pinia";
-import Vue from "vue";
+import type Vue from "vue";
+
+import { useServerMock } from "@/api/client/__mocks__";
 
 import NotificationForm from "./NotificationForm.vue";
 
-jest.mock("@/api/schema");
+// Even though we don't use the API endpoints, this seems to prevent failure fetching
+// openapi during jest testing.
+useServerMock();
 
 const SUBMIT_BUTTON_SELECTOR = "#notification-submit";
 
@@ -46,5 +50,7 @@ describe("NotificationForm.vue", () => {
         const { wrapper } = await mountNotificationForm();
 
         expectSubmitButton(wrapper, false);
+
+        await flushPromises();
     });
 });

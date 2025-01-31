@@ -3,8 +3,26 @@ from typing import (
     Dict,
 )
 
-from galaxy.tools.parameters.meta import process_key
+from galaxy.tools.parameters.wrapped import (
+    nested_key_to_path,
+    process_key,
+)
 from .util import BaseParameterTestCase
+
+
+def test_nested_key_to_path():
+    assert nested_key_to_path("param") == ["param"]
+    assert nested_key_to_path("param_x") == ["param_x"]
+    assert nested_key_to_path("cond|param_x") == ["cond", "param_x"]
+    assert nested_key_to_path("param_") == ["param_"]
+    assert nested_key_to_path("cond|param_") == ["cond", "param_"]
+    assert nested_key_to_path("repeat_1|inner_repeat_1|data_table_column_value") == [
+        "repeat",
+        1,
+        "inner_repeat",
+        1,
+        "data_table_column_value",
+    ]
 
 
 class TestProcessKey:
@@ -434,3 +452,12 @@ class TestParameterParsing(BaseParameterTestCase):
         )
         assert param.type == "data_collection"
         assert param.collection_types == ["list", "list:paired"]
+
+    def test_data_allow_uri_if_protocol(self):
+        param = self._parameter_for(
+            xml="""
+            <param name="deferred" type="data" allow_uri_if_protocol="https,s3">
+            </param>
+        """
+        )
+        assert param.allow_uri_if_protocol == ["https", "s3"]

@@ -1,16 +1,17 @@
 import json
 import logging
 import math
-from typing import Optional
+from typing import (
+    Optional,
+    TYPE_CHECKING,
+)
 
 import packaging.version
 
-from galaxy.tool_util.cwl.parser import (
-    tool_proxy,
-    ToolProxy,
-)
+from galaxy.tool_util.cwl.parser import tool_proxy
 from galaxy.tool_util.deps import requirements
 from .interface import (
+    HelpContent,
     PageSource,
     PagesSource,
     ToolSource,
@@ -23,14 +24,25 @@ from .stdio import (
 )
 from .yaml import YamlInputSource
 
+if TYPE_CHECKING:
+    from galaxy.tool_util.cwl.parser import (
+        OutputInstance,
+        ToolProxy,
+    )
+    from galaxy.tools import Tool
+
 log = logging.getLogger(__name__)
 
 
 class CwlToolSource(ToolSource):
     language = "yaml"
 
-    def __init__(self, tool_file=None, strict_cwl_validation=True, tool_proxy: Optional[ToolProxy] = None):
-        self._cwl_tool_file = tool_file
+    def __init__(
+        self,
+        tool_file: Optional[str] = None,
+        strict_cwl_validation: bool = True,
+        tool_proxy: Optional["ToolProxy"] = None,
+    ):
         self._tool_proxy = tool_proxy
         self._source_path = tool_file
         self._strict_cwl_validation = strict_cwl_validation
@@ -40,7 +52,7 @@ class CwlToolSource(ToolSource):
         return self._source_path
 
     @property
-    def tool_proxy(self) -> ToolProxy:
+    def tool_proxy(self) -> "ToolProxy":
         if self._tool_proxy is None:
             self._tool_proxy = tool_proxy(self._source_path, strict_cwl_validation=self._strict_cwl_validation)
         return self._tool_proxy
@@ -80,7 +92,11 @@ class CwlToolSource(ToolSource):
         return []
 
     def parse_help(self):
-        return self.tool_proxy.doc()
+        doc = self.tool_proxy.doc()
+        if doc:
+            return HelpContent(format="plain_text", content=doc)
+        else:
+            return None
 
     def parse_sanitize(self):
         return False
@@ -113,7 +129,7 @@ class CwlToolSource(ToolSource):
     def parse_interactivetool(self):
         return []
 
-    def parse_input_pages(self):
+    def parse_input_pages(self) -> PagesSource:
         page_source = CwlPageSource(self.tool_proxy)
         return PagesSource([page_source])
 
@@ -128,7 +144,7 @@ class CwlToolSource(ToolSource):
             outputs[output_def.name] = output_def
         return outputs, {}
 
-    def _parse_output(self, tool, output_instance):
+    def _parse_output(self, tool: Optional["Tool"], output_instance: "OutputInstance"):
         name = output_instance.name
         # TODO: handle filters, actions, change_format
         output = ToolOutput(name)
@@ -144,7 +160,7 @@ class CwlToolSource(ToolSource):
         output.count = None
         output.filters = []
         output.tool = tool
-        output.hidden = ""
+        output.hidden = False
         output.dataset_collector_descriptions = []
         output.actions = ToolOutputActionGroup(output, None)
         return output
@@ -179,17 +195,40 @@ class CwlToolSource(ToolSource):
         return json.dumps(self.tool_proxy.to_persistent_representation())
 
 
+class CwlInputSource(YamlInputSource):
+    def __init__(self, as_dict, as_field):
+        super().__init__(as_dict)
+        self._field = as_field
+
+    @property
+    def field(self):
+        return self._field
+
+
 class CwlPageSource(PageSource):
     def __init__(self, tool_proxy):
         cwl_instances = tool_proxy.input_instances()
-        self._input_list = list(map(self._to_input_source, cwl_instances))
+        input_fields = tool_proxy.input_fields()
+        input_list = []
+        for cwl_instance in cwl_instances:
+            name = cwl_instance.name
+            input_field = None
+            for field in input_fields:
+                if field["name"] == name:
+                    input_field = field
+            input_list.append(CwlInputSource(cwl_instance.to_dict(), input_field))
+
+        self._input_list = input_list
 
     def _to_input_source(self, input_instance):
         as_dict = input_instance.to_dict()
-        return YamlInputSource(as_dict)
+        return CwlInputSource(as_dict)
 
     def parse_input_sources(self):
         return self._input_list
+
+    def input_fields(self):
+        return self._input_fields
 
 
 __all__ = (

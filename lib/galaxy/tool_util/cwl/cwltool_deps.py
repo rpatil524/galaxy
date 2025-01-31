@@ -4,12 +4,13 @@ Use this as the import interface for cwltool and just call
 :func:`ensure_cwltool_available` before using any of the imported
 functionality at runtime.
 """
+
 import re
 import warnings
 
 warnings.filterwarnings("ignore", message=r"[\n.]DEPRECATION: Python 2", module="cwltool")
 
-import requests
+from galaxy.util import requests
 
 try:
     from cwltool import (
@@ -63,17 +64,16 @@ except ImportError:
 
 try:
     from cwltool.utils import (
+        CWLObjectType,
+        JobsType,
         normalizeFilesDirs,
         visit_class,
     )
 except ImportError:
+    CWLObjectType = object  # type: ignore[assignment, misc]
+    JobsType = object  # type: ignore[misc, unused-ignore]
     visit_class = None  # type: ignore[assignment]
     normalizeFilesDirs = None  # type: ignore[assignment]
-
-try:
-    import shellescape
-except ImportError:
-    shellescape = None
 
 try:
     import schema_salad
@@ -104,7 +104,7 @@ def ensure_cwltool_available():
 
     Throw an ImportError with a description of the problem if they do not exist.
     """
-    if main is None or workflow is None or shellescape is None:
+    if main is None or workflow is None:
         message = "This feature requires cwltool and dependencies to be available, they are not."
         if main is None:
             message += " cwltool is not unavailable."
@@ -112,8 +112,6 @@ def ensure_cwltool_available():
             message += " cwltool.load_tool.resolve_and_validate_document is unavailable - cwltool version is too old."
         if requests is None:
             message += " Library 'requests' unavailable."
-        if shellescape is None:
-            message += " Library 'shellescape' unavailable."
         if schema_salad is None:
             message += " Library 'schema_salad' unavailable."
         raise ImportError(message)
@@ -121,9 +119,11 @@ def ensure_cwltool_available():
 
 __all__ = (
     "CommentedMap",
+    "CWLObjectType",
     "default_loader",
     "ensure_cwltool_available",
     "getdefault",
+    "JobsType",
     "load_tool",
     "LoadingContext",
     "main",
@@ -136,7 +136,6 @@ __all__ = (
     "resolve_and_validate_document",
     "RuntimeContext",
     "schema_salad",
-    "shellescape",
     "sourceline",
     "StdFsAccess",
     "visit_class",

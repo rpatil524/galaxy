@@ -1,6 +1,7 @@
 """
 Mock infrastructure for testing ModelManagers.
 """
+
 import os
 import shutil
 import tempfile
@@ -28,11 +29,13 @@ from galaxy.managers.histories import HistoryManager
 from galaxy.managers.jobs import JobSearch
 from galaxy.managers.users import UserManager
 from galaxy.managers.workflows import WorkflowsManager
-from galaxy.model import tags
+from galaxy.model import (
+    tags,
+    User,
+)
 from galaxy.model.base import (
     ModelMapping,
     SharedModelMapping,
-    transaction,
 )
 from galaxy.model.mapping import GalaxyModelMapping
 from galaxy.model.scoped_session import galaxy_scoped_session
@@ -41,6 +44,17 @@ from galaxy.model.unittest_utils import (
     GalaxyDataTestConfig,
 )
 from galaxy.security import idencoding
+from galaxy.security.vault import (
+    UserVaultWrapper,
+    Vault,
+    VaultFactory,
+)
+from galaxy.short_term_storage import (
+    ShortTermStorageAllocator,
+    ShortTermStorageConfiguration,
+    ShortTermStorageManager,
+    ShortTermStorageMonitor,
+)
 from galaxy.structured_app import (
     BasicSharedApp,
     MinimalManagerApp,
@@ -52,12 +66,6 @@ from galaxy.tools.cache import ToolCache
 from galaxy.tools.data import ToolDataTableManager
 from galaxy.util import StructuredExecutionTimer
 from galaxy.util.bunch import Bunch
-from galaxy.web.short_term_storage import (
-    ShortTermStorageAllocator,
-    ShortTermStorageConfiguration,
-    ShortTermStorageManager,
-    ShortTermStorageMonitor,
-)
 from galaxy.web_stack import ApplicationStack
 
 
@@ -124,7 +132,7 @@ class MockApp(di.Container, GalaxyDataTestApp):
         self[ShortTermStorageMonitor] = sts_manager  # type: ignore[type-abstract]
         self[galaxy_scoped_session] = self.model.context
         self.visualizations_registry = MockVisualizationsRegistry()
-        self.tag_handler = tags.GalaxyTagHandler(self.model.context)
+        self.tag_handler = tags.GalaxyTagHandler(self.model.session)
         self[tags.GalaxyTagHandler] = self.tag_handler
         self.quota_agent = quota.DatabaseQuotaAgent(self.model)
         self.job_config = Bunch(
@@ -147,6 +155,7 @@ class MockApp(di.Container, GalaxyDataTestApp):
         self.interactivetool_manager = Bunch(create_interactivetool=lambda *args, **kwargs: None)
         self.is_job_handler = False
         self.biotools_metadata_source = None
+        self.trs_proxy = Bunch()
         set_thread_app(self)
 
         def url_for(*args, **kwds):
@@ -158,13 +167,30 @@ class MockApp(di.Container, GalaxyDataTestApp):
     def toolbox(self) -> ToolBox:
         return self._toolbox
 
+    @toolbox.setter
+    def toolbox(self, toolbox: ToolBox):
+        self._toolbox = toolbox
+
     def wait_for_toolbox_reload(self, toolbox):
         # TODO: If the tpm test case passes, does the operation really
         # need to wait.
-        return True
+        return
 
     def reindex_tool_search(self) -> None:
         raise NotImplementedError
+
+    def setup_test_vault(self):
+        config = {
+            "encryption_keys": [
+                "5RrT94ji178vQwha7TAmEix7DojtsLlxVz8Ef17KWgg=",
+                "iNdXd7tRjLnSqRHxuhqQ98GTLU8HUbd5_Xx38iF8nZ0=",
+                "IK83IXhE4_7W7xCFEtD9op0BAs11pJqYN236Spppp7g=",
+            ],
+        }
+        vault = VaultFactory.from_vault_type(self, "database", config)
+        # Ignored because of https://github.com/python/mypy/issues/4717
+        self[Vault] = vault  # type: ignore[type-abstract]
+        self.vault = vault
 
 
 class MockLock:
@@ -258,6 +284,7 @@ class MockAppConfig(GalaxyDataTestConfig, CommonConfigurationMixin):
         self.integrated_tool_panel_config = None
         self.vault_config_file = kwargs.get("vault_config_file")
         self.max_discovered_files = 10000
+        self.display_builtin_converters = True
         self.enable_notification_system = True
 
     @property
@@ -280,6 +307,10 @@ class MockWebapp:
         self.security = security
 
 
+def mock_url_builder(*a, **k):
+    return f"(fake url): {a}, {k}"
+
+
 class MockTrans:
     def __init__(self, app=None, user=None, history=None, **kwargs):
         self.app = cast(UniverseApplication, app or MockApp(**kwargs))
@@ -291,14 +322,14 @@ class MockTrans:
         self.anonymous = False
         self.debug = True
         self.user_is_admin = True
-        self.url_builder = None
+        self.url_builder = mock_url_builder
 
         self.galaxy_session = None
         self.__user = user
         self.security = self.app.security
         self.history = history
 
-        self.request: Any = Bunch(headers={}, is_body_readable=False, host="request.host")
+        self.request: Any = Bunch(headers={}, is_body_readable=False, host="request.host", url_path="mock/url/path")
         self.response: Any = Bunch(headers={}, set_content_type=lambda i: None)
 
     @property
@@ -325,8 +356,7 @@ class MockTrans:
         if self.galaxy_session:
             self.galaxy_session.user = user
             self.sa_session.add(self.galaxy_session)
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
         self.__user = user
 
     user = property(get_user, set_user)
@@ -341,6 +371,26 @@ class MockTrans:
         template = template_lookup.get_template(filename)
         kwargs.update(h=MockTemplateHelpers())
         return template.render(**kwargs)
+
+    @property
+    def username(self):
+        return "testuser"
+
+    @property
+    def email(self):
+        return "testuser@example.com"
+
+    def init_user_in_database(self):
+        u = User(email=self.email, password="password", username=self.username)
+        session = self.model.session
+        session.add(u)
+        session.commit()
+        self.set_user(u)
+
+    @property
+    def user_vault(self):
+        """Provide access to a user's personal vault."""
+        return UserVaultWrapper(self.app.vault, self.user)
 
 
 class MockVisualizationsRegistry:
@@ -379,8 +429,17 @@ class MockDir:
 
 
 class MockTemplateHelpers:
+    def css(*css_files):
+        pass
+
+    def dumps(*kwargs):
+        return {}
+
     def js(*js_files):
         pass
 
-    def css(*css_files):
-        pass
+    def is_url(*kwargs):
+        return True
+
+    def url_for(*kwargs):
+        return "/"

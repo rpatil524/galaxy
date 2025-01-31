@@ -2,7 +2,7 @@ import { defineStore } from "pinia";
 import { computed, ref, set } from "vue";
 
 import { fetchAllBroadcasts } from "@/api/notifications.broadcast";
-import type { components } from "@/api/schema";
+import { type components } from "@/api/schema";
 import { useUserLocalStorage } from "@/composables/userLocalStorage";
 import { mergeObjectListsById } from "@/utils/utils";
 
@@ -40,7 +40,7 @@ export const useBroadcastsStore = defineStore("broadcastsStore", () => {
         set(dismissedBroadcasts.value, broadcast.id, { expiration_time: broadcast.expiration_time });
     }
 
-    function hasExpired(expirationTimeStr?: string) {
+    function hasExpired(expirationTimeStr?: string | null) {
         if (!expirationTimeStr) {
             return false;
         }

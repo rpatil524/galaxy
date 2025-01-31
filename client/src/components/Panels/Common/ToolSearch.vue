@@ -1,9 +1,13 @@
 <script setup lang="ts">
-import { computed, type ComputedRef, onMounted, onUnmounted, type PropType, type Ref, ref } from "vue";
+import { BAlert } from "bootstrap-vue";
+import { storeToRefs } from "pinia";
+import { nextTick } from "vue";
+import { computed, type ComputedRef, onMounted, onUnmounted, type PropType, watch } from "vue";
 import { useRouter } from "vue-router/composables";
 
-import { getGalaxyInstance } from "@/app";
+import { searchToolsByKeys } from "@/components/Panels/utilities";
 import { type Tool, type ToolSection, useToolStore } from "@/stores/toolStore";
+import { useUserStore } from "@/stores/userStore";
 import Filtering, { contains, type ValidFilter } from "@/utils/filtering";
 import _l from "@/utils/localization";
 
@@ -11,6 +15,7 @@ import { type ToolSearchKeys } from "../utilities";
 
 import DelayedInput from "@/components/Common/DelayedInput.vue";
 import FilterMenu from "@/components/Common/FilterMenu.vue";
+import LoadingSpan from "@/components/LoadingSpan.vue";
 
 const router = useRouter();
 
@@ -53,6 +58,10 @@ const props = defineProps({
         type: Object as PropType<Record<string, Tool | ToolSection>>,
         required: true,
     },
+    useWorker: {
+        type: Boolean,
+        default: false,
+    },
 });
 
 const emit = defineEmits<{
@@ -65,8 +74,6 @@ const emit = defineEmits<{
     ): void;
     (e: "onQuery", query: string): void;
 }>();
-
-const searchWorker: Ref<Worker | undefined> = ref(undefined);
 
 const localFilterText = computed({
     get: () => {
@@ -99,7 +106,7 @@ const validFilters: ComputedRef<Record<string, ValidFilter<string>>> = computed(
             placeholder: "EDAM ontology",
             type: String,
             handler: contains("ontology"),
-            datalist: ontologyList,
+            datalist: ontologyList.value,
             menuItem: true,
         },
         id: { placeholder: "id", type: String, handler: contains("id"), menuItem: true },
@@ -109,37 +116,131 @@ const validFilters: ComputedRef<Record<string, ValidFilter<string>>> = computed(
 });
 const ToolFilters: ComputedRef<Filtering<string>> = computed(() => new Filtering(validFilters.value));
 
+const { currentFavorites } = storeToRefs(useUserStore());
 const toolStore = useToolStore();
+const { searchWorker } = storeToRefs(toolStore);
 
 const sectionNames = toolStore.sectionDatalist("default").map((option: { value: string; text: string }) => option.text);
-const ontologyList = toolStore
-    .sectionDatalist("ontology:edam_topics")
-    .concat(toolStore.sectionDatalist("ontology:edam_operations"));
+const ontologyList = computed(() =>
+    toolStore.sectionDatalist("ontology:edam_topics").concat(toolStore.sectionDatalist("ontology:edam_operations"))
+);
+
+interface RequestPaylod {
+    tools: Tool[];
+    keys: ToolSearchKeys;
+    query: string;
+    panelView: string;
+    currentPanel: Record<string, Tool | ToolSection>;
+}
+
+interface SearchEventQuery {
+    type: "searchToolsByKeys";
+    payload: RequestPaylod;
+}
+
+interface SearchEventClear {
+    type: "clearFilter";
+}
+
+interface SearchEventFavorite {
+    type: "favoriteTools";
+}
+
+type SearchEventData = SearchEventQuery | SearchEventClear | SearchEventFavorite;
+
+interface SearchEvent {
+    data: SearchEventData;
+}
+
+interface ResponsePayloadResults {
+    type: "searchToolsByKeysResult";
+    payload: string[];
+    query: string;
+    closestTerm: string | null;
+    sectioned: Record<string, Tool | ToolSection> | null;
+}
+
+interface ResponseClearFilter {
+    type: "clearFilterResult";
+}
+
+interface ResponseFavoriteTools {
+    type: "favoriteToolsResult";
+}
+
+type ResponsePayloadData = ResponsePayloadResults | ResponseClearFilter | ResponseFavoriteTools;
+
+interface ResponsePayload {
+    type: "message";
+    data: ResponsePayloadData;
+}
+
+function handlePost(event: SearchEvent) {
+    const { type } = event.data;
+    if (type === "searchToolsByKeys") {
+        const { tools, keys, query, panelView, currentPanel } = event.data.payload;
+        const { results, resultPanel, closestTerm } = searchToolsByKeys(tools, keys, query, panelView, currentPanel);
+        // send the result back to the main thread
+        onMessage({
+            data: {
+                type: "searchToolsByKeysResult",
+                payload: results.slice(),
+                sectioned: resultPanel,
+                query: query,
+                closestTerm: closestTerm,
+            },
+        } as unknown as MessageEvent);
+    } else if (type === "clearFilter") {
+        onMessage({ data: { type: "clearFilterResult" } } as unknown as MessageEvent);
+    } else if (type === "favoriteTools") {
+        onMessage({ data: { type: "favoriteToolsResult" } } as unknown as MessageEvent);
+    }
+}
+
+function onMessage(event: MessageEvent) {
+    const type = (event as unknown as ResponsePayload).data.type;
+    if (type === "searchToolsByKeysResult") {
+        const data = event.data as ResponsePayloadResults;
+        const { payload, sectioned, query, closestTerm } = data;
+        if (query === props.query) {
+            emit("onResults", payload, sectioned, closestTerm);
+        }
+    } else if (type === "clearFilterResult") {
+        emit("onResults", null, null, null);
+    } else if (type === "favoriteToolsResult") {
+        emit("onResults", currentFavorites.value.tools, null, null);
+    }
+}
 
 onMounted(() => {
-    searchWorker.value = new Worker(new URL("../toolSearch.worker.js", import.meta.url));
-    const Galaxy = getGalaxyInstance();
-    const favoritesResults = Galaxy?.user.getFavorites().tools;
-
-    searchWorker.value.onmessage = ({ data }) => {
-        const { type, payload, sectioned, query, closestTerm } = data;
-        if (type === "searchToolsByKeysResult" && query === props.query) {
-            emit("onResults", payload, sectioned, closestTerm);
-        } else if (type === "clearFilterResult") {
-            emit("onResults", null, null, null);
-        } else if (type === "favoriteToolsResult") {
-            emit("onResults", favoritesResults, null, null);
+    if (props.useWorker) {
+        // initialize worker
+        if (!searchWorker.value) {
+            searchWorker.value = new Worker(new URL("components/Panels/toolSearch.worker.js", import.meta.url));
         }
-    };
+        searchWorker.value.onmessage = onMessage;
+    }
 });
 
 onUnmounted(() => {
-    searchWorker.value?.terminate();
+    // The worker is not terminated but it will not be listening to messages
+    if (searchWorker.value?.onmessage) {
+        searchWorker.value.onmessage = null;
+    }
 });
+
+watch(
+    () => currentFavorites.value.tools,
+    () => {
+        if (FAVORITES.includes(props.query)) {
+            post({ type: "favoriteTools" });
+        }
+    }
+);
 
 function checkQuery(q: string) {
     emit("onQuery", q);
-    if (q && q.length >= MIN_QUERY_LENGTH) {
+    if (q.trim() && q.trim().length >= MIN_QUERY_LENGTH) {
         if (FAVORITES.includes(q)) {
             post({ type: "favoriteTools" });
         } else {
@@ -160,7 +261,13 @@ function checkQuery(q: string) {
 }
 
 function post(message: object) {
-    searchWorker.value?.postMessage(message);
+    if (props.useWorker) {
+        searchWorker.value?.postMessage(message);
+    } else {
+        nextTick(() => {
+            handlePost({ data: message as SearchEventData });
+        });
+    }
 }
 
 function onAdvancedSearch(filters: any) {
@@ -169,7 +276,7 @@ function onAdvancedSearch(filters: any) {
 </script>
 
 <template>
-    <div>
+    <div v-if="searchWorker || !props.userWorker">
         <FilterMenu
             v-if="props.enableAdvanced"
             :class="!propShowAdvanced && 'mb-3'"
@@ -230,10 +337,13 @@ function onAdvancedSearch(filters: any) {
         <DelayedInput
             v-else
             class="mb-3"
-            :query="props.query"
+            :value="props.query"
             :delay="200"
             :loading="queryPending"
             :placeholder="placeholder"
             @change="checkQuery" />
     </div>
+    <BAlert v-else class="mb-3" variant="info" show>
+        <LoadingSpan message="Loading Tool Search" />
+    </BAlert>
 </template>

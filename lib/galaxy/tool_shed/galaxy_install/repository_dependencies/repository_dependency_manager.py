@@ -2,9 +2,11 @@
 Class encapsulating the management of repository dependencies installed or being installed
 into Galaxy from the Tool Shed.
 """
+
 import json
 import logging
 import os
+from typing import TYPE_CHECKING
 from urllib.error import HTTPError
 from urllib.parse import (
     urlencode,
@@ -15,8 +17,6 @@ from urllib.request import (
     urlopen,
 )
 
-from galaxy.model.base import transaction
-from galaxy.tool_shed.galaxy_install import installed_repository_manager
 from galaxy.tool_shed.galaxy_install.tools import tool_panel_manager
 from galaxy.tool_shed.util import repository_util
 from galaxy.tool_shed.util.container_util import get_components_from_key
@@ -34,11 +34,14 @@ from galaxy.util.tool_shed import (
     encoding_util,
 )
 
+if TYPE_CHECKING:
+    from galaxy.tool_shed.galaxy_install.client import InstallationTarget
+
 log = logging.getLogger(__name__)
 
 
 class RepositoryDependencyInstallManager:
-    def __init__(self, app):
+    def __init__(self, app: "InstallationTarget"):
         self.app = app
 
     def build_repository_dependency_relationships(self, repo_info_dicts, tool_shed_repositories):
@@ -137,8 +140,7 @@ class RepositoryDependencyInstallManager:
                                     )
                                     session = install_model.context
                                     session.add(repository_dependency)
-                                    with transaction(session):
-                                        session.commit()
+                                    session.commit()
 
                                 # Build the relationship between the d_repository and the required_repository.
                                 rrda = install_model.RepositoryRepositoryDependencyAssociation(
@@ -147,8 +149,7 @@ class RepositoryDependencyInstallManager:
                                 )
                                 session = install_model.context
                                 session.add(rrda)
-                                with transaction(session):
-                                    session.commit()
+                                session.commit()
 
     def create_repository_dependency_objects(
         self,
@@ -192,7 +193,7 @@ class RepositoryDependencyInstallManager:
         all_repo_info_dicts = all_required_repo_info_dict.get("all_repo_info_dicts", [])
         if not all_repo_info_dicts:
             # No repository dependencies were discovered so process the received repositories.
-            all_repo_info_dicts = [rid for rid in repo_info_dicts]
+            all_repo_info_dicts = list(repo_info_dicts)
         for repo_info_dict in all_repo_info_dicts:
             # If the user elected to install repository dependencies, all items in the
             # all_repo_info_dicts list will be processed.  However, if repository dependencies
@@ -269,7 +270,7 @@ class RepositoryDependencyInstallManager:
                                 log.info(
                                     f"Reactivating deactivated tool_shed_repository '{str(repository_db_record.name)}'."
                                 )
-                                irm = installed_repository_manager.InstalledRepositoryManager(self.app)
+                                irm = self.app.installed_repository_manager
                                 irm.activate_repository(repository_db_record)
                                 # No additional updates to the database record are necessary.
                                 can_update_db_record = False
@@ -582,8 +583,7 @@ class RepositoryDependencyInstallManager:
 
         session = self.app.install_model.context
         session.add(repository)
-        with transaction(session):
-            session.commit()
+        session.commit()
 
 
 def _urlopen(url, data=None):

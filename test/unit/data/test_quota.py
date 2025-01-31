@@ -1,6 +1,7 @@
 import uuid
 
 from galaxy import model
+from galaxy.model.unittest_utils.utils import random_email
 from galaxy.objectstore import (
     QuotaSourceInfo,
     QuotaSourceMap,
@@ -16,7 +17,7 @@ class TestPurgeUsage(BaseModelTestCase):
     def setUp(self):
         super().setUp()
         model = self.model
-        u = model.User(email="purge_usage@example.com", password="password")
+        u = model.User(email=random_email(), password="password")
         u.disk_usage = 25
         self.persist(u)
 
@@ -67,7 +68,7 @@ class TestPurgeUsage(BaseModelTestCase):
 class TestCalculateUsage(BaseModelTestCase):
     def setUp(self):
         model = self.model
-        u = model.User(email="calc_usage%s@example.com" % str(uuid.uuid1()), password="password")
+        u = model.User(email=f"calc_usage{uuid.uuid1()}@example.com", password="password")
         self.persist(u)
         h = model.History(name="History for Calculated Usage", user=u)
         self.persist(h)
@@ -111,6 +112,21 @@ class TestCalculateUsage(BaseModelTestCase):
 
         assert u.calculate_disk_usage_default_source(object_store) == 10
 
+    def test_calculate_usage_with_user_provided_storage(self):
+        u = self.u
+
+        self._add_dataset(10)
+        # This dataset should not be counted towards the user's disk usage
+        self._add_dataset(30, object_store_id="user_objects://user/provided/storage")
+
+        object_store = MockObjectStore()
+        assert u.calculate_disk_usage_default_source(object_store) == 10
+        assert u.disk_usage is None
+        u.calculate_and_set_disk_usage(object_store)
+        assert u.calculate_disk_usage_default_source(object_store) == 10
+
+        self._refresh_user_and_assert_disk_usage_is(10)
+
     def test_calculate_usage_readjusts_incorrect_quota(self):
         u = self.u
 
@@ -141,6 +157,20 @@ class TestCalculateUsage(BaseModelTestCase):
         # recalculate and verify it is fixed
         u.calculate_and_set_disk_usage(object_store)
         self._refresh_user_and_assert_disk_usage_is(10)
+
+    def test_calculate_objectstore_usage(self):
+        # not strictly a quota check but such similar code and ideas...
+        u = self.u
+
+        self._add_dataset(10, "not_tracked")
+        self._add_dataset(15, "tracked")
+
+        usage = u.dictify_objectstore_usage()
+        assert len(usage) == 2
+
+        usage_dict = {u.object_store_id: u.total_disk_usage for u in usage}
+        assert int(usage_dict["not_tracked"]) == 10
+        assert int(usage_dict["tracked"]) == 15
 
     def test_calculate_usage_disabled_quota(self):
         u = self.u
@@ -284,10 +314,58 @@ class TestCalculateUsage(BaseModelTestCase):
         assert usages[1].quota_source_label == "alt_source"
         assert usages[1].total_disk_usage == 15
 
-    def _refresh_user_and_assert_disk_usage_is(self, usage):
+    def test_update_usage_from_labeled_to_unlabeled(self):
+        model = self.model
+        quota_agent = DatabaseQuotaAgent(model)
+        u = self.u
+
+        self._add_dataset(10)
+        alt_d = self._add_dataset(15, "alt_source_store")
+        self.model.session.flush()
+        assert quota_agent
+
+        quota_source_map = QuotaSourceMap(None, True)
+        alt_source = QuotaSourceMap("alt_source", True)
+        quota_source_map.backends["alt_source_store"] = alt_source
+
+        object_store = MockObjectStore(quota_source_map)
+        u.calculate_and_set_disk_usage(object_store)
+        self._refresh_user_and_assert_disk_usage_is(10)
+        quota_agent.relabel_quota_for_dataset(alt_d.dataset, "alt_source", None)
+        self._refresh_user_and_assert_disk_usage_is(25)
+        self._refresh_user_and_assert_disk_usage_is(0, "alt_source")
+
+    def test_update_usage_from_unlabeled_to_labeled(self):
+        model = self.model
+        quota_agent = DatabaseQuotaAgent(model)
+        u = self.u
+
+        d = self._add_dataset(10)
+        self._add_dataset(15, "alt_source_store")
+        self.model.session.flush()
+        assert quota_agent
+
+        quota_source_map = QuotaSourceMap(None, True)
+        alt_source = QuotaSourceMap("alt_source", True)
+        quota_source_map.backends["alt_source_store"] = alt_source
+
+        object_store = MockObjectStore(quota_source_map)
+        u.calculate_and_set_disk_usage(object_store)
+        self._refresh_user_and_assert_disk_usage_is(15, "alt_source")
+        quota_agent.relabel_quota_for_dataset(d.dataset, None, "alt_source")
+        self._refresh_user_and_assert_disk_usage_is(25, "alt_source")
+        self._refresh_user_and_assert_disk_usage_is(0, None)
+
+    def _refresh_user_and_assert_disk_usage_is(self, usage, label=None):
         u = self.u
         self.model.context.refresh(u)
-        assert u.disk_usage == usage
+        if label is None:
+            assert u.disk_usage == usage
+        else:
+            usages = u.dictify_usage()
+            for u in usages:
+                if u.quota_source_label == label:
+                    assert int(u.total_disk_usage) == int(usage)
 
 
 class TestQuota(BaseModelTestCase):

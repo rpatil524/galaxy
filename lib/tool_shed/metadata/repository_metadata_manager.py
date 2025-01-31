@@ -13,7 +13,6 @@ from sqlalchemy import (
 )
 
 from galaxy import util
-from galaxy.model.base import transaction
 from galaxy.tool_shed.metadata.metadata_generator import (
     BaseMetadataGenerator,
     HandleResultT,
@@ -48,7 +47,7 @@ class ToolShedMetadataGenerator(BaseMetadataGenerator):
     """A MetadataGenerator building on ToolShed's app and repository constructs."""
 
     app: ToolShedApp
-    repository: Optional[Repository]
+    repository: Optional[Repository]  # type:ignore[assignment]
 
     # why is mypy making me re-annotate these things from the base class, it didn't
     # when they were in the same file
@@ -270,8 +269,7 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
             repository_metadata.tool_versions = tool_versions_dict
             self.sa_session.add(repository_metadata)
             session = self.sa_session()
-            with transaction(session):
-                session.commit()
+            session.commit()
 
     def build_repository_ids_select_field(
         self, name="repository_ids", multiple=True, display="checkboxes", my_writable=False
@@ -297,8 +295,7 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
             if changeset_revision not in changeset_revisions:
                 self.sa_session.delete(repository_metadata)
                 session = self.sa_session()
-                with transaction(session):
-                    session.commit()
+                session.commit()
 
     def compare_changeset_revisions(self, ancestor_changeset_revision, ancestor_metadata_dict):
         """
@@ -365,19 +362,17 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
 
         def __data_manager_dict_to_tuple_list(metadata_dict):
             # we do not check tool_guid or tool conf file name
-            return set(
-                sorted(
-                    (
-                        name,
-                        tuple(sorted(value.get("data_tables", []))),
-                        value.get("guid"),
-                        value.get("version"),
-                        value.get("name"),
-                        value.get("id"),
-                    )
-                    for name, value in metadata_dict.items()
+            return {
+                (
+                    name,
+                    tuple(sorted(value.get("data_tables", []))),
+                    value.get("guid"),
+                    value.get("version"),
+                    value.get("name"),
+                    value.get("id"),
                 )
-            )
+                for name, value in metadata_dict.items()
+            }
 
         # only compare valid entries, any invalid entries are ignored
         ancestor_metadata = __data_manager_dict_to_tuple_list(ancestor_metadata.get("data_managers", {}))
@@ -526,8 +521,7 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
         repository_metadata.missing_test_components = False
         self.sa_session.add(repository_metadata)
         session = self.sa_session()
-        with transaction(session):
-            session.commit()
+        session.commit()
 
         return repository_metadata
 
@@ -910,18 +904,16 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
                 repository_metadata.tool_versions = tool_versions_dict
                 self.sa_session.add(repository_metadata)
                 session = self.sa_session()
-                with transaction(session):
-                    session.commit()
+                session.commit()
 
     def reset_metadata_on_selected_repositories(self, **kwd):
         """
         Inspect the repository changelog to reset metadata for all appropriate changeset revisions.
         This method is called from both Galaxy and the Tool Shed.
         """
-        repository_ids = util.listify(kwd.get("repository_ids", None))
         message = ""
         status = "done"
-        if repository_ids:
+        if repository_ids := util.listify(kwd.get("repository_ids", None)):
             successful_count = 0
             unsuccessful_count = 0
             for repository_id in repository_ids:
@@ -946,12 +938,12 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
                 except Exception:
                     log.exception("Error attempting to reset metadata on repository %s", str(repository.name))
                     unsuccessful_count += 1
-            message = "Successfully reset metadata on %d %s.  " % (
+            message = "Successfully reset metadata on {} {}.  ".format(
                 successful_count,
                 inflector.cond_plural(successful_count, "repository"),
             )
             if unsuccessful_count:
-                message += "Error setting metadata on %d %s - see the paster log for details.  " % (
+                message += "Error setting metadata on {} {} - see the paster log for details.  ".format(
                     unsuccessful_count,
                     inflector.cond_plural(unsuccessful_count, "repository"),
                 )
@@ -960,9 +952,11 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
             status = "error"
         return message, status
 
-    def set_repository(self, repository, repository_clone_url=None):
+    def set_repository(
+        self, repository, relative_install_dir: Optional[str] = None, changeset_revision: Optional[str] = None
+    ):
         super().set_repository(repository)
-        self.repository_clone_url = repository_clone_url or common_util.generate_clone_url_for(self.trans, repository)
+        self.repository_clone_url = relative_install_dir or common_util.generate_clone_url_for(self.trans, repository)
 
     def set_repository_metadata(self, host, content_alert_str="", **kwd):
         """
@@ -1022,8 +1016,7 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
                     repository_metadata.missing_test_components = False
                     self.sa_session.add(repository_metadata)
                     session = self.sa_session()
-                    with transaction(session):
-                        session.commit()
+                    session.commit()
                 else:
                     # There are no metadata records associated with the repository.
                     repository_metadata = self.create_or_update_repository_metadata(
@@ -1039,10 +1032,10 @@ class RepositoryMetadataManager(ToolShedMetadataGenerator):
                         changeset_revisions.append(changeset_revision)
                 self._add_tool_versions(repository_id, repository_metadata, changeset_revisions)
         elif len(repo) == 1 and not self.invalid_file_tups:
-            message = "Revision <b>%s</b> includes no Galaxy utilities for which metadata can " % str(
-                self.repository.tip()
+            message = (
+                f"Revision <b>{self.repository.tip()}</b> includes no Galaxy utilities for which metadata can "
+                "be defined so this revision cannot be automatically installed into a local Galaxy instance."
             )
-            message += "be defined so this revision cannot be automatically installed into a local Galaxy instance."
             status = "error"
         if self.invalid_file_tups:
             message = tool_util.generate_message_for_invalid_tools(

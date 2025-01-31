@@ -24,6 +24,7 @@ from typing import (
     Iterable,
     Iterator,
     List,
+    Literal,
     Optional,
     Set,
     Tuple,
@@ -31,9 +32,14 @@ from typing import (
     TYPE_CHECKING,
     Union,
 )
+from urllib.parse import urlparse
 
 from bdbag import bdbag_api as bdb
 from boltons.iterutils import remap
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+)
 from rocrate.model.computationalworkflow import (
     ComputationalWorkflow,
     WorkflowDescription,
@@ -53,10 +59,10 @@ from galaxy.exceptions import (
 )
 from galaxy.files import (
     ConfiguredFileSources,
-    ProvidesUserFileSourcesUserContext,
+    ProvidesFileSourcesUserContext,
 )
 from galaxy.files.uris import stream_url_to_file
-from galaxy.model.base import transaction
+from galaxy.model.base import ensure_object_added_to_session
 from galaxy.model.mapping import GalaxyModelMapping
 from galaxy.model.metadata import MetadataCollection
 from galaxy.model.orm.util import (
@@ -93,7 +99,10 @@ from galaxy.schema.bco.util import (
     get_contributors,
     write_to_file,
 )
-from galaxy.schema.schema import ModelStoreFormat
+from galaxy.schema.schema import (
+    DatasetStateField,
+    ModelStoreFormat,
+)
 from galaxy.security.idencoding import IdEncodingHelper
 from galaxy.util import (
     FILENAME_VALID_CHARS,
@@ -117,7 +126,10 @@ from ... import model
 
 if TYPE_CHECKING:
     from galaxy.managers.workflows import WorkflowContentsManager
-    from galaxy.model import ImplicitCollectionJobs
+    from galaxy.model import (
+        HistoryItem,
+        ImplicitCollectionJobs,
+    )
     from galaxy.model.tags import GalaxyTagHandlerSession
 
 log = logging.getLogger(__name__)
@@ -133,12 +145,14 @@ ATTRS_FILENAME_EXPORT = "export_attrs.txt"
 ATTRS_FILENAME_LIBRARIES = "libraries_attrs.txt"
 ATTRS_FILENAME_LIBRARY_FOLDERS = "library_folders_attrs.txt"
 ATTRS_FILENAME_INVOCATIONS = "invocation_attrs.txt"
+ATTRS_FILENAME_CONVERSIONS = "implicit_dataset_conversions.txt"
 TRACEBACK = "traceback.txt"
 GALAXY_EXPORT_VERSION = "2"
 
 DICT_STORE_ATTRS_KEY_HISTORY = "history"
 DICT_STORE_ATTRS_KEY_DATASETS = "datasets"
 DICT_STORE_ATTRS_KEY_COLLECTIONS = "collections"
+DICT_STORE_ATTRS_KEY_CONVERSIONS = "implicit_dataset_conversions"
 DICT_STORE_ATTRS_KEY_JOBS = "jobs"
 DICT_STORE_ATTRS_KEY_IMPLICIT_COLLECTION_JOBS = "implicit_collection_jobs"
 DICT_STORE_ATTRS_KEY_LIBRARIES = "libraries"
@@ -167,6 +181,18 @@ class ImportDiscardedDataType(Enum):
     ALLOW = "allow"
     # Import all datasets as discarded regardless of whether file data is available in the store.
     FORCE = "force"
+
+
+class DatasetAttributeImportModel(BaseModel):
+    state: Optional[DatasetStateField] = None
+    external_filename: Optional[str] = None
+    _extra_files_path: Optional[str] = None
+    file_size: Optional[int] = None
+    object_store_id: Optional[str] = None
+    total_size: Optional[int] = None
+    created_from_basename: Optional[str] = None
+    uuid: Optional[str] = None
+    model_config = ConfigDict(extra="ignore")
 
 
 DEFAULT_DISCARDED_DATA_TYPE = ImportDiscardedDataType.FORBID
@@ -269,8 +295,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
             self.import_history_encoded_id = None
 
     @abc.abstractmethod
-    def workflow_paths(self) -> Iterator[Tuple[str, str]]:
-        ...
+    def workflow_paths(self) -> Iterator[Tuple[str, str]]: ...
 
     @abc.abstractmethod
     def defines_new_history(self) -> bool:
@@ -289,20 +314,22 @@ class ModelImportStore(metaclass=abc.ABCMeta):
         return []
 
     @abc.abstractmethod
-    def invocations_properties(self) -> List[Dict[str, Any]]:
-        ...
+    def invocations_properties(self) -> List[Dict[str, Any]]: ...
 
     @abc.abstractmethod
     def collections_properties(self) -> List[Dict[str, Any]]:
         """Return a list of HDCA properties."""
 
     @abc.abstractmethod
+    def implicit_dataset_conversion_properties(self) -> List[Dict[str, Any]]:
+        """Return a list of ImplicitlyConvertedDatasetAssociation properties."""
+
+    @abc.abstractmethod
     def jobs_properties(self) -> List[Dict[str, Any]]:
         """Return a list of jobs properties."""
 
     @abc.abstractmethod
-    def implicit_collection_jobs_properties(self) -> List[Dict[str, Any]]:
-        ...
+    def implicit_collection_jobs_properties(self) -> List[Dict[str, Any]]: ...
 
     @property
     @abc.abstractmethod
@@ -385,6 +412,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
         self._import_collection_instances(object_import_tracker, collections_attrs, history, new_history)
         self._import_collection_implicit_input_associations(object_import_tracker, collections_attrs)
         self._import_collection_copied_associations(object_import_tracker, collections_attrs)
+        self._import_implicit_dataset_conversions(object_import_tracker)
         self._reassign_hids(object_import_tracker, history)
         self._import_jobs(object_import_tracker, history)
         self._import_implicit_collection_jobs(object_import_tracker)
@@ -437,22 +465,13 @@ class ModelImportStore(metaclass=abc.ABCMeta):
         def handle_dataset_object_edit(dataset_instance, dataset_attrs):
             if "dataset" in dataset_attrs:
                 assert self.import_options.allow_dataset_object_edit
-                dataset_attributes = [
-                    "state",
-                    "deleted",
-                    "purged",
-                    "external_filename",
-                    "_extra_files_path",
-                    "file_size",
-                    "object_store_id",
-                    "total_size",
-                    "created_from_basename",
-                    "uuid",
-                ]
-
-                for attribute in dataset_attributes:
-                    if attribute in dataset_attrs["dataset"]:
-                        setattr(dataset_instance.dataset, attribute, dataset_attrs["dataset"][attribute])
+                dataset_attributes = DatasetAttributeImportModel(**dataset_attrs["dataset"]).model_dump(
+                    exclude_unset=True,
+                )
+                for attribute, value in dataset_attributes.items():
+                    setattr(dataset_instance.dataset, attribute, value)
+                if dataset_instance.dataset.purged:
+                    dataset_instance.dataset.full_delete()
                 self._attach_dataset_hashes(dataset_attrs["dataset"], dataset_instance)
                 self._attach_dataset_sources(dataset_attrs["dataset"], dataset_instance)
                 if "id" in dataset_attrs["dataset"] and self.import_options.allow_edit:
@@ -461,12 +480,11 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                         if (
                             dataset_association is not dataset_instance
                             and dataset_association.extension == dataset_instance.extension
+                            or dataset_association.extension == "auto"
                         ):
-                            dataset_association.metadata = dataset_instance.metadata
-                            dataset_association.blurb = dataset_instance.blurb
-                            dataset_association.peek = dataset_instance.peek
-                            dataset_association.info = dataset_instance.info
-                            dataset_association.tool_version = dataset_instance.tool_version
+                            copy_dataset_instance_metadata_attributes(
+                                source=dataset_instance, target=dataset_association
+                            )
                 if job:
                     dataset_instance.dataset.job_id = job.id
 
@@ -559,10 +577,11 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                 self._attach_raw_id_if_editing(dataset_instance, dataset_attrs)
 
                 # Older style...
-                if "uuid" in dataset_attrs:
-                    dataset_instance.dataset.uuid = dataset_attrs["uuid"]
-                if "dataset_uuid" in dataset_attrs:
-                    dataset_instance.dataset.uuid = dataset_attrs["dataset_uuid"]
+                if self.import_options.allow_edit:
+                    if "uuid" in dataset_attrs:
+                        dataset_instance.dataset.uuid = dataset_attrs["uuid"]
+                    if "dataset_uuid" in dataset_attrs:
+                        dataset_instance.dataset.uuid = dataset_attrs["dataset_uuid"]
 
                 self._session_add(dataset_instance)
 
@@ -613,10 +632,9 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                     discarded_data = self.import_options.discarded_data
                     dataset_state = dataset_attrs.get("state", dataset_instance.states.OK)
                     if dataset_state == dataset_instance.states.DEFERRED:
-                        dataset_instance._state = dataset_instance.states.DEFERRED
+                        dataset_instance.state = dataset_instance.states.DEFERRED
                         dataset_instance.deleted = False
                         dataset_instance.purged = False
-                        dataset_instance.dataset.state = dataset_instance.states.DEFERRED
                         dataset_instance.dataset.deleted = False
                         dataset_instance.dataset.purged = False
                     elif (
@@ -628,7 +646,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                         target_state = (
                             dataset_instance.states.DISCARDED if is_discarded else dataset_instance.states.DEFERRED
                         )
-                        dataset_instance._state = target_state
+                        dataset_instance.state = target_state
                         deleted = is_discarded and (discarded_data == ImportDiscardedDataType.FORBID)
                         dataset_instance.deleted = deleted
                         dataset_instance.purged = deleted
@@ -639,19 +657,20 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                         dataset_instance.state = dataset_state
                         if not self.object_store:
                             raise Exception(f"self.object_store is missing from {self}.")
-                        self.object_store.update_from_file(
-                            dataset_instance.dataset, file_name=temp_dataset_file_name, create=True
-                        )
+                        if not dataset_instance.dataset.purged:
+                            self.object_store.update_from_file(
+                                dataset_instance.dataset, file_name=temp_dataset_file_name, create=True
+                            )
 
-                        # Import additional files if present. Histories exported previously might not have this attribute set.
-                        dataset_extra_files_path = dataset_attrs.get("extra_files_path", None)
-                        if dataset_extra_files_path:
-                            assert file_source_root
-                            dataset_extra_files_path = os.path.join(file_source_root, dataset_extra_files_path)
-                            persist_extra_files(self.object_store, dataset_extra_files_path, dataset_instance)
-                        # Don't trust serialized file size
-                        dataset_instance.dataset.file_size = None
-                        dataset_instance.dataset.set_total_size()  # update the filesize record in the database
+                            # Import additional files if present. Histories exported previously might not have this attribute set.
+                            dataset_extra_files_path = dataset_attrs.get("extra_files_path", None)
+                            if dataset_extra_files_path:
+                                assert file_source_root
+                                dataset_extra_files_path = os.path.join(file_source_root, dataset_extra_files_path)
+                                persist_extra_files(self.object_store, dataset_extra_files_path, dataset_instance)
+                            # Only trust file size if the dataset is purged. If we keep the data we should check the file size.
+                            dataset_instance.dataset.file_size = None
+                            dataset_instance.dataset.set_total_size()  # update the filesize record in the database
 
                     if dataset_instance.deleted:
                         dataset_instance.dataset.deleted = True
@@ -701,7 +720,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                                         dataset_instance.datatype.set_meta(dataset_instance)
                                 except Exception:
                                     log.debug(f"Metadata setting failed on {dataset_instance}", exc_info=True)
-                                    dataset_instance.dataset.state = dataset_instance.dataset.states.FAILED_METADATA
+                                    dataset_instance.state = dataset_instance.dataset.states.FAILED_METADATA
 
                 if model_class == "HistoryDatasetAssociation":
                     if not isinstance(dataset_instance, model.HistoryDatasetAssociation):
@@ -755,8 +774,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                     ld.library_dataset_dataset_association = ldda
                 self._session_add(ld)
 
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
             return library_folder
 
         libraries_attrs = self.library_properties()
@@ -979,14 +997,16 @@ class ModelImportStore(metaclass=abc.ABCMeta):
             # sense.
             hdca_copied_from_sinks = object_import_tracker.hdca_copied_from_sinks
             if copied_from_object_key in object_import_tracker.hdcas_by_key:
-                hdca.copied_from_history_dataset_collection_association = object_import_tracker.hdcas_by_key[
-                    copied_from_object_key
-                ]
+                source_hdca = object_import_tracker.hdcas_by_key[copied_from_object_key]
+                if source_hdca is not hdca:
+                    # We may not have the copied source, in which case the first included HDCA in the chain
+                    # acts as the source, so here we make sure we don't create a cycle.
+                    hdca.copied_from_history_dataset_collection_association = source_hdca
             else:
                 if copied_from_object_key in hdca_copied_from_sinks:
-                    hdca.copied_from_history_dataset_collection_association = object_import_tracker.hdcas_by_key[
-                        hdca_copied_from_sinks[copied_from_object_key]
-                    ]
+                    source_hdca = object_import_tracker.hdcas_by_key[hdca_copied_from_sinks[copied_from_object_key]]
+                    if source_hdca is not hdca:
+                        hdca.copied_from_history_dataset_collection_association = source_hdca
                 else:
                     hdca_copied_from_sinks[copied_from_object_key] = dataset_collection_key
 
@@ -1000,6 +1020,13 @@ class ModelImportStore(metaclass=abc.ABCMeta):
             for obj in requires_hid:
                 history.stage_addition(obj)
             history.add_pending_items()
+
+            if object_import_tracker.copy_hid_for:
+                # in an if to avoid flush if unneeded
+                for from_dataset, to_dataset in object_import_tracker.copy_hid_for:
+                    to_dataset.hid = from_dataset.hid
+                    self._session_add(to_dataset)
+                self._flush()
 
     def _import_workflow_invocations(
         self, object_import_tracker: "ObjectImportTracker", history: Optional[model.History]
@@ -1022,8 +1049,8 @@ class ModelImportStore(metaclass=abc.ABCMeta):
         for invocation_attrs in invocations_attrs:
             assert not self.import_options.allow_edit
             imported_invocation = model.WorkflowInvocation()
-            imported_invocation.user = self.user
             imported_invocation.history = history
+            ensure_object_added_to_session(imported_invocation, object_in_session=history)
             workflow_key = invocation_attrs["workflow"]
             if workflow_key not in object_import_tracker.workflows_by_key:
                 raise Exception(f"Failed to find key {workflow_key} in {object_import_tracker.workflows_by_key.keys()}")
@@ -1045,6 +1072,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
             for step_attrs in invocation_attrs["steps"]:
                 imported_invocation_step = model.WorkflowInvocationStep()
                 imported_invocation_step.workflow_invocation = imported_invocation
+                ensure_object_added_to_session(imported_invocation_step, session=self.sa_session)
                 attach_workflow_step(imported_invocation_step, step_attrs)
                 restore_times(imported_invocation_step, step_attrs)
                 imported_invocation_step.action = step_attrs["action"]
@@ -1055,6 +1083,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                 if "job" in step_attrs:
                     job = object_import_tracker.jobs_by_key[step_attrs["job"][object_key]]
                     imported_invocation_step.job = job
+                    ensure_object_added_to_session(imported_invocation_step, object_in_session=job)
                 elif "implicit_collection_jobs" in step_attrs:
                     icj = object_import_tracker.implicit_collection_jobs_by_key[
                         step_attrs["implicit_collection_jobs"][object_key]
@@ -1216,7 +1245,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
                 continue
 
             imported_job = model.Job()
-            imported_job.id = job_attrs.get("id")
+            imported_job.id = cast(int, job_attrs.get("id"))
             imported_job.user = self.user
             add_object_to_session(imported_job, history_sa_session)
             imported_job.history = history
@@ -1238,6 +1267,35 @@ class ModelImportStore(metaclass=abc.ABCMeta):
 
             if object_key in job_attrs:
                 object_import_tracker.jobs_by_key[job_attrs[object_key]] = imported_job
+
+    def _import_implicit_dataset_conversions(self, object_import_tracker: "ObjectImportTracker") -> None:
+        implicit_dataset_conversion_attrs = self.implicit_dataset_conversion_properties()
+        for idc_attrs in implicit_dataset_conversion_attrs:
+            # I don't know what metadata_safe does per se... should we copy this property or
+            # just set it to False?
+            metadata_safe = False
+            idc = model.ImplicitlyConvertedDatasetAssociation(metadata_safe=metadata_safe, for_import=True)
+            idc.type = idc_attrs["file_type"]
+            # We may not have exported the parent, so only set the parent_hda attribute if we did.
+            if (parent_hda_id := idc_attrs.get("parent_hda")) and (
+                parent_hda := object_import_tracker.hdas_by_key.get(parent_hda_id)
+            ):
+                # exports created prior to 24.2 may not have a parent if the parent had been purged
+                idc.parent_hda = parent_hda
+            if idc_attrs.get("hda"):
+                idc.dataset = object_import_tracker.hdas_by_key[idc_attrs["hda"]]
+
+            # we have the dataset and the parent, lets ensure they land up with the same HID
+            if idc.dataset and idc.parent_hda:
+                try:
+                    object_import_tracker.requires_hid.remove(idc.dataset)
+                except ValueError:
+                    pass  # we wanted to remove it anyway.
+                # A HDA can be the parent of multiple implicitly converted dataset,
+                # that's thy we use [(source, target)] here
+                object_import_tracker.copy_hid_for.append((idc.parent_hda, idc.dataset))
+
+            self._session_add(idc)
 
     def _import_implicit_collection_jobs(self, object_import_tracker: "ObjectImportTracker") -> None:
         object_key = self.object_key
@@ -1268,8 +1326,7 @@ class ModelImportStore(metaclass=abc.ABCMeta):
         self.sa_session.add(obj)
 
     def _flush(self) -> None:
-        with transaction(self.sa_session):
-            self.sa_session.commit()
+        self.sa_session.commit()
 
 
 def _copied_from_object_key(
@@ -1317,7 +1374,8 @@ class ObjectImportTracker:
     hda_copied_from_sinks: Dict[ObjectKeyType, ObjectKeyType]
     hdca_copied_from_sinks: Dict[ObjectKeyType, ObjectKeyType]
     jobs_by_key: Dict[ObjectKeyType, model.Job]
-    requires_hid: List[Union[model.HistoryDatasetAssociation, model.HistoryDatasetCollectionAssociation]]
+    requires_hid: List["HistoryItem"]
+    copy_hid_for: List[Tuple["HistoryItem", "HistoryItem"]]
 
     def __init__(self) -> None:
         self.libraries_by_key = {}
@@ -1335,6 +1393,7 @@ class ObjectImportTracker:
         self.implicit_collection_jobs_by_key: Dict[str, ImplicitCollectionJobs] = {}
         self.workflows_by_key: Dict[str, model.Workflow] = {}
         self.requires_hid = []
+        self.copy_hid_for = []
 
         self.new_history: Optional[model.History] = None
 
@@ -1418,6 +1477,9 @@ class DictImportModelStore(ModelImportStore):
     def collections_properties(self) -> List[Dict[str, Any]]:
         return self._store_as_dict.get(DICT_STORE_ATTRS_KEY_COLLECTIONS) or []
 
+    def implicit_dataset_conversion_properties(self) -> List[Dict[str, Any]]:
+        return self._store_as_dict.get(DICT_STORE_ATTRS_KEY_CONVERSIONS) or []
+
     def library_properties(
         self,
     ) -> List[Dict[str, Any]]:
@@ -1453,8 +1515,7 @@ class BaseDirectoryImportModelStore(ModelImportStore):
         _find_hda: Callable,
         _find_hdca: Callable,
         _find_dce: Callable,
-    ) -> Dict[str, Any]:
-        ...
+    ) -> Dict[str, Any]: ...
 
     @abc.abstractmethod
     def _connect_job_io(
@@ -1464,8 +1525,7 @@ class BaseDirectoryImportModelStore(ModelImportStore):
         _find_hda: Callable,
         _find_hdca: Callable,
         _find_dce: Callable,
-    ) -> None:
-        ...
+    ) -> None: ...
 
     @property
     def file_source_root(self) -> str:
@@ -1493,6 +1553,9 @@ class BaseDirectoryImportModelStore(ModelImportStore):
 
     def collections_properties(self) -> List[Dict[str, Any]]:
         return self._read_list_if_exists(ATTRS_FILENAME_COLLECTIONS)
+
+    def implicit_dataset_conversion_properties(self) -> List[Dict[str, Any]]:
+        return self._read_list_if_exists(ATTRS_FILENAME_CONVERSIONS)
 
     def library_properties(
         self,
@@ -1544,6 +1607,7 @@ class BaseDirectoryImportModelStore(ModelImportStore):
             "tool_stderr",
             "job_stdout",
             "job_stderr",
+            "galaxy_version",
         )
         for attribute in ATTRIBUTES:
             value = job_attrs.get(attribute)
@@ -1564,7 +1628,7 @@ class BaseDirectoryImportModelStore(ModelImportStore):
             attrs = load(open(file_name))
         else:
             if required:
-                raise Exception("Failed to find file [%s] in model store archive" % file_name)
+                raise Exception(f"Failed to find file [{file_name}] in model store archive")
             attrs = []
         return attrs
 
@@ -1845,7 +1909,7 @@ class DirectoryModelExportStore(ModelExportStore):
             sessionless = True
             security = IdEncodingHelper(id_secret="randomdoesntmatter")
 
-        self.user_context = ProvidesUserFileSourcesUserContext(user_context)
+        self.user_context = ProvidesFileSourcesUserContext(user_context)
         self.file_sources = file_sources
         self.serialize_jobs = serialize_jobs
         self.sessionless = sessionless
@@ -1860,12 +1924,15 @@ class DirectoryModelExportStore(ModelExportStore):
         )
         self.export_files = export_files
         self.included_datasets: Dict[model.DatasetInstance, Tuple[model.DatasetInstance, bool]] = {}
-        self.included_collections: List[Union[model.DatasetCollection, model.HistoryDatasetCollectionAssociation]] = []
+        self.dataset_implicit_conversions: Dict[model.DatasetInstance, model.ImplicitlyConvertedDatasetAssociation] = {}
+        self.included_collections: Dict[
+            Union[model.DatasetCollection, model.HistoryDatasetCollectionAssociation],
+            Union[model.DatasetCollection, model.HistoryDatasetCollectionAssociation],
+        ] = {}
         self.included_libraries: List[model.Library] = []
         self.included_library_folders: List[model.LibraryFolder] = []
         self.included_invocations: List[model.WorkflowInvocation] = []
         self.collection_datasets: Set[int] = set()
-        self.collections_attrs: List[Union[model.DatasetCollection, model.HistoryDatasetCollectionAssociation]] = []
         self.dataset_id_to_path: Dict[int, Tuple[Optional[str], Optional[str]]] = {}
 
         self.job_output_dataset_associations: Dict[int, Dict[str, model.DatasetInstance]] = {}
@@ -1913,8 +1980,6 @@ class DirectoryModelExportStore(ModelExportStore):
 
         dir_name = "datasets"
         dir_path = os.path.join(export_directory, dir_name)
-        dataset_hid = as_dict["hid"]
-        assert dataset_hid, as_dict
 
         if dataset.dataset.id in self.dataset_id_to_path:
             file_name, extra_files_path = self.dataset_id_to_path[dataset.dataset.id]
@@ -1928,9 +1993,14 @@ class DirectoryModelExportStore(ModelExportStore):
             if not os.path.exists(dir_path):
                 os.makedirs(dir_path)
 
-            target_filename = get_export_dataset_filename(as_dict["name"], as_dict["extension"], dataset_hid)
+            conversion = self.dataset_implicit_conversions.get(dataset)
+            conversion_key = (
+                self.serialization_options.get_identifier(self.security, conversion) if conversion else None
+            )
+            target_filename = get_export_dataset_filename(
+                as_dict["name"], as_dict["extension"], as_dict["encoded_id"], conversion_key=conversion_key
+            )
             arcname = os.path.join(dir_name, target_filename)
-
             src = file_name
             dest = os.path.join(export_directory, arcname)
             add(src, dest)
@@ -1943,7 +2013,10 @@ class DirectoryModelExportStore(ModelExportStore):
                 file_list = []
 
             if len(file_list):
-                arcname = os.path.join(dir_name, f"extra_files_path_{dataset_hid}")
+                extra_files_target_filename = get_export_dataset_extra_files_dir_name(
+                    as_dict["encoded_id"], conversion_key=conversion_key
+                )
+                arcname = os.path.join(dir_name, extra_files_target_filename)
                 add(extra_files_path, os.path.join(export_directory, arcname))
                 as_dict["extra_files_path"] = arcname
             else:
@@ -1968,8 +2041,7 @@ class DirectoryModelExportStore(ModelExportStore):
 
     def export_job(self, job: model.Job, tool=None, include_job_data=True):
         self.export_jobs([job], include_job_data=include_job_data)
-        tool_source = getattr(tool, "tool_source", None)
-        if tool_source:
+        if tool_source := getattr(tool, "tool_source", None):
             with open(os.path.join(self.export_directory, "tool.xml"), "w") as out:
                 out.write(tool_source.to_string())
 
@@ -2000,78 +2072,84 @@ class DirectoryModelExportStore(ModelExportStore):
                 output_dataset_collection_mapping: Dict[str, List[Union[str, int]]] = {}
                 implicit_output_dataset_collection_mapping: Dict[str, List[Union[str, int]]] = {}
 
-                for assoc in job.input_datasets:
+                for id_assoc in job.input_datasets:
                     # Optional data inputs will not have a dataset.
-                    if assoc.dataset:
-                        name = assoc.name
+                    if id_assoc.dataset:
+                        name = id_assoc.name
                         if name not in input_dataset_mapping:
                             input_dataset_mapping[name] = []
 
-                        input_dataset_mapping[name].append(self.exported_key(assoc.dataset))
+                        input_dataset_mapping[name].append(self.exported_key(id_assoc.dataset))
                         if include_job_data:
-                            self.add_dataset(assoc.dataset)
+                            self.add_dataset(id_assoc.dataset)
 
-                for assoc in job.output_datasets:
+                for od_assoc in job.output_datasets:
                     # Optional data inputs will not have a dataset.
-                    if assoc.dataset:
-                        name = assoc.name
+                    if od_assoc.dataset:
+                        name = od_assoc.name
                         if name not in output_dataset_mapping:
                             output_dataset_mapping[name] = []
 
-                        output_dataset_mapping[name].append(self.exported_key(assoc.dataset))
+                        output_dataset_mapping[name].append(self.exported_key(od_assoc.dataset))
                         if include_job_data:
-                            self.add_dataset(assoc.dataset)
+                            self.add_dataset(od_assoc.dataset)
 
-                for assoc in job.input_dataset_collections:
+                for idc_assoc in job.input_dataset_collections:
                     # Optional data inputs will not have a dataset.
-                    if assoc.dataset_collection:
-                        name = assoc.name
+                    if idc_assoc.dataset_collection:
+                        name = idc_assoc.name
                         if name not in input_dataset_collection_mapping:
                             input_dataset_collection_mapping[name] = []
 
-                        input_dataset_collection_mapping[name].append(self.exported_key(assoc.dataset_collection))
+                        input_dataset_collection_mapping[name].append(self.exported_key(idc_assoc.dataset_collection))
                         if include_job_data:
-                            self.export_collection(assoc.dataset_collection)
+                            self.export_collection(idc_assoc.dataset_collection)
 
-                for assoc in job.input_dataset_collection_elements:
-                    if assoc.dataset_collection_element:
-                        name = assoc.name
+                for idce_assoc in job.input_dataset_collection_elements:
+                    if idce_assoc.dataset_collection_element:
+                        name = idce_assoc.name
                         if name not in input_dataset_collection_element_mapping:
                             input_dataset_collection_element_mapping[name] = []
 
                         input_dataset_collection_element_mapping[name].append(
-                            self.exported_key(assoc.dataset_collection_element)
+                            self.exported_key(idce_assoc.dataset_collection_element)
                         )
                         if include_job_data:
-                            if assoc.dataset_collection_element.is_collection:
-                                self.export_collection(assoc.dataset_collection_element.element_object)
+                            if idce_assoc.dataset_collection_element.is_collection:
+                                assert isinstance(
+                                    idce_assoc.dataset_collection_element.element_object, model.DatasetCollection
+                                )
+                                self.export_collection(idce_assoc.dataset_collection_element.element_object)
                             else:
-                                self.add_dataset(assoc.dataset_collection_element.element_object)
+                                assert isinstance(
+                                    idce_assoc.dataset_collection_element.element_object, model.DatasetInstance
+                                )
+                                self.add_dataset(idce_assoc.dataset_collection_element.element_object)
 
-                for assoc in job.output_dataset_collection_instances:
+                for odci_assoc in job.output_dataset_collection_instances:
                     # Optional data outputs will not have a dataset.
                     # These are implicit outputs, we don't need to export them
-                    if assoc.dataset_collection_instance:
-                        name = assoc.name
+                    if odci_assoc.dataset_collection_instance:
+                        name = odci_assoc.name
                         if name not in output_dataset_collection_mapping:
                             output_dataset_collection_mapping[name] = []
 
                         output_dataset_collection_mapping[name].append(
-                            self.exported_key(assoc.dataset_collection_instance)
+                            self.exported_key(odci_assoc.dataset_collection_instance)
                         )
 
-                for assoc in job.output_dataset_collections:
-                    if assoc.dataset_collection:
-                        name = assoc.name
+                for odc_assoc in job.output_dataset_collections:
+                    if odc_assoc.dataset_collection:
+                        name = odc_assoc.name
 
                         if name not in implicit_output_dataset_collection_mapping:
                             implicit_output_dataset_collection_mapping[name] = []
 
                         implicit_output_dataset_collection_mapping[name].append(
-                            self.exported_key(assoc.dataset_collection)
+                            self.exported_key(odc_assoc.dataset_collection)
                         )
                         if include_job_data:
-                            self.export_collection(assoc.dataset_collection)
+                            self.export_collection(odc_assoc.dataset_collection)
 
                 job_attrs["input_dataset_mapping"] = input_dataset_mapping
                 job_attrs["input_dataset_collection_mapping"] = input_dataset_collection_mapping
@@ -2102,12 +2180,12 @@ class DirectoryModelExportStore(ModelExportStore):
         sa_session = app.model.session
 
         # Write collections' attributes (including datasets list) to file.
-        stmt = (
+        stmt_hdca = (
             select(model.HistoryDatasetCollectionAssociation)
             .where(model.HistoryDatasetCollectionAssociation.history == history)
             .where(model.HistoryDatasetCollectionAssociation.deleted == expression.false())
         )
-        collections = sa_session.scalars(stmt)
+        collections = sa_session.scalars(stmt_hdca)
 
         for collection in collections:
             # filter this ?
@@ -2119,9 +2197,9 @@ class DirectoryModelExportStore(ModelExportStore):
             self.export_collection(collection, include_deleted=include_deleted)
 
         # Write datasets' attributes to file.
-        actions_backref = model.Dataset.actions  # type: ignore[attr-defined]
+        actions_backref = model.Dataset.actions
 
-        stmt = (
+        stmt_hda = (
             select(model.HistoryDatasetAssociation)
             .where(model.HistoryDatasetAssociation.history == history)
             .join(model.Dataset)
@@ -2129,7 +2207,7 @@ class DirectoryModelExportStore(ModelExportStore):
             .order_by(model.HistoryDatasetAssociation.hid)
             .where(model.Dataset.purged == expression.false())
         )
-        datasets = sa_session.scalars(stmt).unique()
+        datasets = sa_session.scalars(stmt_hda).unique()
         for dataset in datasets:
             dataset.annotation = get_item_annotation_str(sa_session, history.user, dataset)
             should_include_file = (dataset.visible or include_hidden) and (not dataset.deleted or include_deleted)
@@ -2139,7 +2217,13 @@ class DirectoryModelExportStore(ModelExportStore):
             if dataset not in self.included_datasets:
                 if should_include_file:
                     self._ensure_dataset_file_exists(dataset)
-                self.add_dataset(dataset, include_files=should_include_file)
+                if dataset.implicitly_converted_parent_datasets:
+                    # fetching 0th of list but I think this is just a mapping quirk - I can't imagine how there
+                    # would be more than one of these -John
+                    conversion = dataset.implicitly_converted_parent_datasets[0]
+                    self.add_implicit_conversion_dataset(dataset, should_include_file, conversion)
+                else:
+                    self.add_dataset(dataset, include_files=should_include_file)
 
     def export_library(
         self, library: model.Library, include_hidden: bool = False, include_deleted: bool = False
@@ -2215,8 +2299,24 @@ class DirectoryModelExportStore(ModelExportStore):
     def add_dataset_collection(
         self, collection: Union[model.DatasetCollection, model.HistoryDatasetCollectionAssociation]
     ) -> None:
-        self.collections_attrs.append(collection)
-        self.included_collections.append(collection)
+        self.included_collections[collection] = collection
+
+    def add_implicit_conversion_dataset(
+        self,
+        dataset: model.DatasetInstance,
+        include_files: bool,
+        conversion: model.ImplicitlyConvertedDatasetAssociation,
+    ) -> None:
+        parent_hda = conversion.parent_hda
+        if parent_hda and parent_hda not in self.included_datasets:
+            # We should always include the parent of an implicit conversion
+            # to avoid holes in the provenance.
+            self.included_datasets[parent_hda] = (parent_hda, include_files)
+            grand_parent_association = parent_hda.implicitly_converted_parent_datasets
+            if grand_parent_association and (grand_parent_hda := grand_parent_association[0].parent_hda):
+                self.add_implicit_conversion_dataset(grand_parent_hda, include_files, grand_parent_association[0])
+        self.included_datasets[dataset] = (dataset, include_files)
+        self.dataset_implicit_conversions[dataset] = conversion
 
     def add_dataset(self, dataset: model.DatasetInstance, include_files: bool = True) -> None:
         self.included_datasets[dataset] = (dataset, include_files)
@@ -2262,7 +2362,11 @@ class DirectoryModelExportStore(ModelExportStore):
 
         collections_attrs_filename = os.path.join(export_directory, ATTRS_FILENAME_COLLECTIONS)
         with open(collections_attrs_filename, "w") as collections_attrs_out:
-            collections_attrs_out.write(to_json(self.collections_attrs))
+            collections_attrs_out.write(to_json(self.included_collections.values()))
+
+        conversions_attrs_filename = os.path.join(export_directory, ATTRS_FILENAME_CONVERSIONS)
+        with open(conversions_attrs_filename, "w") as conversions_attrs_out:
+            conversions_attrs_out.write(to_json(self.dataset_implicit_conversions.values()))
 
         jobs_attrs = []
         for job_id, job_output_dataset_associations in self.job_output_dataset_associations.items():
@@ -2279,17 +2383,16 @@ class DirectoryModelExportStore(ModelExportStore):
             #
 
             # Get all jobs associated with included HDAs.
-            jobs_dict: Dict[str, model.Job] = {}
+            jobs_dict: Dict[int, model.Job] = {}
             implicit_collection_jobs_dict = {}
 
             def record_job(job):
-                if not job:
-                    # No viable job.
+                if not job or job.id in jobs_dict:
+                    # No viable job or job already recorded.
                     return
 
                 jobs_dict[job.id] = job
-                icja = job.implicit_collection_jobs_association
-                if icja:
+                if icja := job.implicit_collection_jobs_association:
                     implicit_collection_jobs = icja.implicit_collection_jobs
                     implicit_collection_jobs_dict[implicit_collection_jobs.id] = implicit_collection_jobs
 
@@ -2310,13 +2413,12 @@ class DirectoryModelExportStore(ModelExportStore):
                         f"Expected a HistoryDatasetAssociation or LibraryDatasetDatasetAssociation, but got a {type(hda)}: {hda}"
                     )
                 job_hda = hda
-                while getattr(
-                    job_hda, "copied_from_history_dataset_association", None
-                ):  # should this check library datasets as well?
-                    job_hda = job_hda.copied_from_history_dataset_association  # type: ignore[union-attr]
-                if not job_hda.creating_job_associations:
-                    # No viable HDA found.
-                    continue
+                while job_hda.copied_from_history_dataset_association:  # should this check library datasets as well?
+                    # record job (if one exists) even if dataset was copied
+                    # copy could have been created manually through UI/API or using database operation tool,
+                    # in which case we have a relevant job to export.
+                    record_associated_jobs(job_hda)
+                    job_hda = job_hda.copied_from_history_dataset_association
 
                 record_associated_jobs(job_hda)
 
@@ -2387,12 +2489,12 @@ class WriteCrates:
     included_invocations: List[model.WorkflowInvocation]
     export_directory: StrPath
     included_datasets: Dict[model.DatasetInstance, Tuple[model.DatasetInstance, bool]]
+    dataset_implicit_conversions: Dict[model.DatasetInstance, model.ImplicitlyConvertedDatasetAssociation]
     dataset_id_to_path: Dict[int, Tuple[Optional[str], Optional[str]]]
 
     @property
     @abc.abstractmethod
-    def workflows_directory(self) -> str:
-        ...
+    def workflows_directory(self) -> str: ...
 
     def _generate_markdown_readme(self) -> str:
         markdown_parts: List[str] = []
@@ -2514,8 +2616,18 @@ class BcoExportOptions:
     override_xref: Optional[List[XrefItem]] = None
 
 
-class BcoModelExportStore(WorkflowInvocationOnlyExportStore):
-    def __init__(self, uri, export_options: BcoExportOptions, **kwds):
+class FileSourceModelExportStore(abc.ABC, DirectoryModelExportStore):
+    """
+    Export to file sources, from where data can be retrieved later on using a URI.
+    """
+
+    file_source_uri: Optional[StrPath] = None
+    # data can be retrieved later using this URI
+
+    out_file: StrPath
+    # the output file is written to this path, from which it is written to the file source
+
+    def __init__(self, uri, **kwds):
         temp_output_dir = tempfile.mkdtemp()
         self.temp_output_dir = temp_output_dir
         if "://" in str(uri):
@@ -2526,18 +2638,46 @@ class BcoModelExportStore(WorkflowInvocationOnlyExportStore):
             self.out_file = uri
             self.file_source_uri = None
             export_directory = temp_output_dir
-        self.export_options = export_options
         super().__init__(export_directory, **kwds)
 
+    @abc.abstractmethod
+    def _generate_output_file(self) -> None:
+        """
+        Generate the output file that will be uploaded to the file source.
+
+        Produce an output file and save it to `self.out_file`. A common pattern for this method to create an archive out
+        of `self.export_directory`.
+
+        This method runs after `DirectoryModelExportStore._finalize()`. Therefore, `self.export_directory` will already
+        have been populated when it runs.
+        """
+
     def _finalize(self):
-        super()._finalize()
-        core_biocompute_object, object_id = self._core_biocompute_object_and_object_id()
-        write_to_file(object_id, core_biocompute_object, self.out_file)
+        super()._finalize()  # populate `self.export_directory`
+        self._generate_output_file()  # generate the output file `self.out_file`
         if self.file_source_uri:
+            # upload output file to file source
+            if not self.file_sources:
+                raise Exception(f"Need self.file_sources but {type(self)} is missing it: {self.file_sources}.")
+            file_source_uri = urlparse(str(self.file_source_uri))
             file_source_path = self.file_sources.get_file_source_path(self.file_source_uri)
             file_source = file_source_path.file_source
             assert os.path.exists(self.out_file)
-            file_source.write_from(file_source_path.path, self.out_file, user_context=self.user_context)
+            self.file_source_uri = f"{file_source_uri.scheme}://{file_source_uri.netloc}" + file_source.write_from(
+                file_source_path.path, self.out_file, user_context=self.user_context
+            )
+        shutil.rmtree(self.temp_output_dir)
+
+
+class BcoModelExportStore(FileSourceModelExportStore, WorkflowInvocationOnlyExportStore):
+
+    def __init__(self, uri, export_options: BcoExportOptions, **kwds):
+        self.export_options = export_options
+        super().__init__(uri, **kwds)
+
+    def _generate_output_file(self):
+        core_biocompute_object, object_id = self._core_biocompute_object_and_object_id()
+        write_to_file(object_id, core_biocompute_object, self.out_file)
 
     def _core_biocompute_object_and_object_id(self) -> Tuple[BioComputeObjectCore, str]:
         assert self.app  # need app.security to do anything...
@@ -2689,14 +2829,14 @@ class BcoModelExportStore(WorkflowInvocationOnlyExportStore):
             empirical_error=export_options.override_empirical_error or {},
             algorithmic_error=export_options.override_algorithmic_error or {},
         )
-        usability_domain = UsabilityDomain(__root__=usability_domain_str)
+        usability_domain = UsabilityDomain(root=usability_domain_str)
         description_domain = DescriptionDomain(
             keywords=keywords,
             xref=export_options.override_xref or [],
             platform=["Galaxy"],
             pipeline_steps=pipeline_steps,
         )
-        parametric_domain = ParametricDomain(__root__=parametric_domain_items)
+        parametric_domain = ParametricDomain(root=parametric_domain_items)
         io_domain = InputAndOutputDomain(
             input_subdomain=input_subdomain_items,
             output_subdomain=output_subdomain_items,
@@ -2727,25 +2867,9 @@ class ROCrateModelExportStore(DirectoryModelExportStore, WriteCrates):
         ro_crate.write(self.crate_directory)
 
 
-class ROCrateArchiveModelExportStore(DirectoryModelExportStore, WriteCrates):
-    file_source_uri: Optional[StrPath]
-    out_file: StrPath
+class ROCrateArchiveModelExportStore(FileSourceModelExportStore, WriteCrates):
 
-    def __init__(self, uri: StrPath, **kwds) -> None:
-        temp_output_dir = tempfile.mkdtemp()
-        self.temp_output_dir = temp_output_dir
-        if "://" in str(uri):
-            self.out_file = os.path.join(temp_output_dir, "out")
-            self.file_source_uri = uri
-            export_directory = os.path.join(temp_output_dir, "export")
-        else:
-            self.out_file = uri
-            self.file_source_uri = None
-            export_directory = temp_output_dir
-        super().__init__(export_directory, **kwds)
-
-    def _finalize(self) -> None:
-        super()._finalize()
+    def _generate_output_file(self):
         ro_crate = self._init_crate()
         ro_crate.write(self.export_directory)
         out_file_name = str(self.out_file)
@@ -2753,48 +2877,18 @@ class ROCrateArchiveModelExportStore(DirectoryModelExportStore, WriteCrates):
             out_file = out_file_name[: -len(".zip")]
         else:
             out_file = out_file_name
-        rval = shutil.make_archive(out_file, "zip", self.export_directory)
-        if not self.file_source_uri:
-            shutil.move(rval, self.out_file)
-        else:
-            if not self.file_sources:
-                raise Exception(f"Need self.file_sources but {type(self)} is missing it: {self.file_sources}.")
-            file_source_path = self.file_sources.get_file_source_path(self.file_source_uri)
-            file_source = file_source_path.file_source
-            assert os.path.exists(rval), rval
-            file_source.write_from(file_source_path.path, rval, user_context=self.user_context)
-        shutil.rmtree(self.temp_output_dir)
+        archive = shutil.make_archive(out_file, "fastzip", self.export_directory)
+        shutil.move(archive, self.out_file)
 
 
-class TarModelExportStore(DirectoryModelExportStore):
-    file_source_uri: Optional[StrPath]
-    out_file: StrPath
+class TarModelExportStore(FileSourceModelExportStore):
 
     def __init__(self, uri: StrPath, gzip: bool = True, **kwds) -> None:
         self.gzip = gzip
-        temp_output_dir = tempfile.mkdtemp()
-        self.temp_output_dir = temp_output_dir
-        if "://" in str(uri):
-            self.out_file = os.path.join(temp_output_dir, "out")
-            self.file_source_uri = uri
-            export_directory = os.path.join(temp_output_dir, "export")
-        else:
-            self.out_file = uri
-            self.file_source_uri = None
-            export_directory = temp_output_dir
-        super().__init__(export_directory, **kwds)
+        super().__init__(uri, **kwds)
 
-    def _finalize(self) -> None:
-        super()._finalize()
+    def _generate_output_file(self):
         tar_export_directory(self.export_directory, self.out_file, self.gzip)
-        if self.file_source_uri:
-            if not self.file_sources:
-                raise Exception(f"Need self.file_sources but {type(self)} is missing it: {self.file_sources}.")
-            file_source_path = self.file_sources.get_file_source_path(self.file_source_uri)
-            file_source = file_source_path.file_source
-            assert os.path.exists(self.out_file)
-            file_source.write_from(file_source_path.path, self.out_file, user_context=self.user_context)
-        shutil.rmtree(self.temp_output_dir)
 
 
 class BagDirectoryModelExportStore(DirectoryModelExportStore):
@@ -2807,37 +2901,16 @@ class BagDirectoryModelExportStore(DirectoryModelExportStore):
         bdb.make_bag(self.out_directory)
 
 
-class BagArchiveModelExportStore(BagDirectoryModelExportStore):
-    file_source_uri: Optional[StrPath]
+class BagArchiveModelExportStore(FileSourceModelExportStore, BagDirectoryModelExportStore):
 
     def __init__(self, uri: StrPath, bag_archiver: str = "tgz", **kwds) -> None:
         # bag_archiver in tgz, zip, tar
         self.bag_archiver = bag_archiver
-        temp_output_dir = tempfile.mkdtemp()
-        self.temp_output_dir = temp_output_dir
-        if "://" in str(uri):
-            # self.out_file = os.path.join(temp_output_dir, "out")
-            self.file_source_uri = uri
-            export_directory = os.path.join(temp_output_dir, "export")
-        else:
-            self.out_file = uri
-            self.file_source_uri = None
-            export_directory = temp_output_dir
-        super().__init__(export_directory, **kwds)
+        super().__init__(uri, **kwds)
 
-    def _finalize(self) -> None:
-        super()._finalize()
-        rval = bdb.archive_bag(self.export_directory, self.bag_archiver)
-        if not self.file_source_uri:
-            shutil.move(rval, self.out_file)
-        else:
-            if not self.file_sources:
-                raise Exception(f"Need self.file_sources but {type(self)} is missing it: {self.file_sources}.")
-            file_source_path = self.file_sources.get_file_source_path(self.file_source_uri)
-            file_source = file_source_path.file_source
-            assert os.path.exists(rval)
-            file_source.write_from(file_source_path.path, rval, user_context=self.user_context)
-        shutil.rmtree(self.temp_output_dir)
+    def _generate_output_file(self):
+        archive = bdb.archive_bag(self.export_directory, self.bag_archiver)
+        shutil.move(archive, self.out_file)
 
 
 def get_export_store_factory(
@@ -2846,13 +2919,8 @@ def get_export_store_factory(
     export_files=None,
     bco_export_options: Optional[BcoExportOptions] = None,
     user_context=None,
-) -> Callable[[StrPath], ModelExportStore]:
-    export_store_class: Union[
-        Type[TarModelExportStore],
-        Type[BagArchiveModelExportStore],
-        Type[ROCrateArchiveModelExportStore],
-        Type[BcoModelExportStore],
-    ]
+) -> Callable[[StrPath], FileSourceModelExportStore]:
+    export_store_class: Type[FileSourceModelExportStore]
     export_store_class_kwds = {
         "app": app,
         "export_files": export_files,
@@ -2882,21 +2950,29 @@ def get_export_store_factory(
 
 
 def tar_export_directory(export_directory: StrPath, out_file: StrPath, gzip: bool) -> None:
-    tarfile_mode = "w"
-    if gzip:
-        tarfile_mode += ":gz"
+    tarfile_mode: Literal["w", "w:gz"] = "w:gz" if gzip else "w"
 
     with tarfile.open(out_file, tarfile_mode, dereference=True) as store_archive:
         for export_path in os.listdir(export_directory):
             store_archive.add(os.path.join(export_directory, export_path), arcname=export_path)
 
 
-def get_export_dataset_filename(name: str, ext: str, hid: int) -> str:
+def get_export_dataset_filename(name: str, ext: str, encoded_id: str, conversion_key: Optional[str]) -> str:
     """
     Builds a filename for a dataset using its name an extension.
     """
     base = "".join(c in FILENAME_VALID_CHARS and c or "_" for c in name)
-    return f"{base}_{hid}.{ext}"
+    if not conversion_key:
+        return f"{base}_{encoded_id}.{ext}"
+    else:
+        return f"{base}_{encoded_id}_conversion_{conversion_key}.{ext}"
+
+
+def get_export_dataset_extra_files_dir_name(encoded_id: str, conversion_key: Optional[str]) -> str:
+    if not conversion_key:
+        return f"extra_files_path_{encoded_id}"
+    else:
+        return f"extra_files_path_{encoded_id}_conversion_{conversion_key}"
 
 
 def imported_store_for_metadata(
@@ -2936,7 +3012,7 @@ def source_to_import_store(
         if source_uri.startswith("file://"):
             source_uri = source_uri[len("file://") :]
         if "://" in source_uri:
-            user_context = ProvidesUserFileSourcesUserContext(user_context)
+            user_context = ProvidesFileSourcesUserContext(user_context)
             source_uri = stream_url_to_file(
                 source_uri, app.file_sources, prefix="gx_import_model_store", user_context=user_context
             )
@@ -2961,7 +3037,8 @@ def source_to_import_store(
             if ModelStoreFormat.is_compressed(model_store_format):
                 try:
                     temp_dir = mkdtemp()
-                    target_dir = CompressedFile(target_path).extract(temp_dir)
+                    with CompressedFile(target_path) as cf:
+                        target_dir = cf.extract(temp_dir)
                 finally:
                     if delete:
                         os.remove(target_path)
@@ -2990,3 +3067,12 @@ def payload_to_source_uri(payload) -> str:
             dump(store_dict, f)
         source_uri = f"file://{import_json}"
     return source_uri
+
+
+def copy_dataset_instance_metadata_attributes(source: model.DatasetInstance, target: model.DatasetInstance) -> None:
+    target.metadata = source.metadata
+    target.blurb = source.blurb
+    target.peek = source.peek
+    target.info = source.info
+    target.tool_version = source.tool_version
+    target.extension = source.extension

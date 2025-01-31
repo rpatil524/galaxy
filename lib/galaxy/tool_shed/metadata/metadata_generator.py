@@ -12,7 +12,10 @@ from typing import (
     Union,
 )
 
-from typing_extensions import Protocol
+from typing_extensions import (
+    Protocol,
+    TypedDict,
+)
 
 from galaxy import util
 from galaxy.model.tool_shed_install import ToolShedRepository
@@ -64,12 +67,26 @@ NOT_TOOL_CONFIGS = [
 ]
 
 
+class RepositoryMetadataToolDict(TypedDict):
+    id: str
+    guid: str
+    name: str
+    version: str
+    profile: str
+    description: Optional[str]
+    version_string_cmd: Optional[str]
+    tool_config: str
+    tool_type: str
+    requirements: Optional[Any]
+    tests: Optional[Any]
+    add_to_tool_panel: bool
+
+
 class RepositoryProtocol(Protocol):
     name: str
     id: str
 
-    def repo_path(self, app) -> Optional[str]:
-        ...
+    def repo_path(self, app) -> Optional[str]: ...
 
 
 class BaseMetadataGenerator:
@@ -102,7 +119,7 @@ class BaseMetadataGenerator:
         repo_path = self.repository.repo_path(self.app)
         if hasattr(self.repository, "repo_files_directory"):
             # Galaxy Side.
-            repo_files_directory = self.repository.repo_files_directory(self.app)  # type: ignore[attr-defined]
+            repo_files_directory = self.repository.repo_files_directory(self.app)
             repo_dir = repo_files_directory
         else:
             # Tool Shed side.
@@ -135,8 +152,7 @@ class BaseMetadataGenerator:
                 tool_conf_name = os.path.join(tool_path, tool_conf_name)
             tools[tool_conf_name] = tool
         root = tree.getroot()
-        data_manager_tool_path = root.get("tool_path", None)
-        if data_manager_tool_path:
+        if data_manager_tool_path := root.get("tool_path", None):
             relative_data_manager_dir = os.path.join(relative_data_manager_dir, data_manager_tool_path)
         for i, data_manager_elem in enumerate(root.findall("data_manager")):
             tool_file = data_manager_elem.get("tool_file", None)
@@ -493,9 +509,9 @@ class BaseMetadataGenerator:
             root = tree.getroot()
             xml_is_valid = root.tag == "repositories"
         if xml_is_valid:
-            invalid_repository_dependencies_dict = dict(description=root.get("description"))
+            invalid_repository_dependencies_dict: Dict[str, Any] = dict(description=root.get("description"))
             invalid_repository_dependency_tups = []
-            valid_repository_dependencies_dict = dict(description=root.get("description"))
+            valid_repository_dependencies_dict: Dict[str, Any] = dict(description=root.get("description"))
             valid_repository_dependency_tups = []
             for repository_elem in root.findall("repository"):
                 repository_dependency_tup, repository_dependency_is_valid, err_msg = self.handle_repository_elem(
@@ -599,7 +615,7 @@ class BaseMetadataGenerator:
         # should not be displayed in the tool panel are datatypes converters and DataManager tools
         # (which are of type 'manage_data').
         add_to_tool_panel_attribute = self._set_add_to_tool_panel_attribute_for_tool(tool)
-        tool_dict = dict(
+        tool_dict = RepositoryMetadataToolDict(
             id=tool.id,
             guid=guid,
             name=tool.name,
@@ -706,13 +722,12 @@ class BaseMetadataGenerator:
             if original_valid_tool_dependencies_dict:
                 # We're generating metadata on an update pulled to a tool shed repository installed
                 # into a Galaxy instance, so handle changes to tool dependencies appropriately.
-                installation_target = cast(InstallationTarget, self.app)
-                irm = installation_target.installed_repository_manager
-                (
-                    updated_tool_dependency_names,
-                    deleted_tool_dependency_names,
-                ) = irm.handle_existing_tool_dependencies_that_changed_in_update(
-                    self.repository, original_valid_tool_dependencies_dict, rvs.valid_tool_dependencies_dict
+                assert isinstance(self.app, InstallationTarget)
+                irm = self.app.installed_repository_manager
+                assert self.repository
+                gx_repository = cast(ToolShedRepository, self.repository)
+                irm.handle_existing_tool_dependencies_that_changed_in_update(
+                    gx_repository, original_valid_tool_dependencies_dict, rvs.valid_tool_dependencies_dict
                 )
             metadata_dict["tool_dependencies"] = rvs.valid_tool_dependencies_dict
         if rvs.invalid_tool_dependencies_dict:
@@ -856,7 +871,7 @@ class GalaxyMetadataGenerator(BaseMetadataGenerator):
     """A MetadataGenerator building on Galaxy's app and repository constructs."""
 
     app: InstallationTarget
-    repository: Optional[ToolShedRepository]
+    repository: Optional[ToolShedRepository]  # type:ignore[assignment]
 
     def __init__(
         self,

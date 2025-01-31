@@ -1,25 +1,44 @@
 <script setup lang="ts">
-import { library } from "@fortawesome/fontawesome-svg-core";
-import { faCopy, faFile, faFolder } from "@fortawesome/free-regular-svg-icons";
-import { faExclamation, faLink, faUnlink } from "@fortawesome/free-solid-svg-icons";
+import {
+    faCaretDown,
+    faCaretUp,
+    faExclamation,
+    faLink,
+    faPlus,
+    faSpinner,
+    faUnlink,
+} from "@fortawesome/free-solid-svg-icons";
 import { FontAwesomeIcon } from "@fortawesome/vue-fontawesome";
-import { BButton, BButtonGroup, BFormCheckbox } from "bootstrap-vue";
+import { BAlert, BButton, BButtonGroup, BCollapse, BFormCheckbox, BTooltip } from "bootstrap-vue";
+import { storeToRefs } from "pinia";
 import { computed, onMounted, type Ref, ref, watch } from "vue";
 
+import { isDatasetElement, isDCE } from "@/api";
 import { getGalaxyInstance } from "@/app";
+import { useDatatypesMapper } from "@/composables/datatypesMapper";
+import { useUid } from "@/composables/utils/uid";
 import { type EventData, useEventStore } from "@/stores/eventStore";
+import { useHistoryStore } from "@/stores/historyStore";
+import { orList } from "@/utils/strings";
 
 import type { DataOption } from "./types";
 import { BATCH, SOURCE, VARIANTS } from "./variants";
 
+import FormSelection from "../FormSelection.vue";
+import CollectionCreatorModal from "@/components/Collections/CollectionCreatorModal.vue";
 import FormSelect from "@/components/Form/Elements/FormSelect.vue";
+import HelpText from "@/components/Help/HelpText.vue";
 
-library.add(faCopy, faExclamation, faFile, faFolder, faLink, faUnlink);
+const COLLECTION_TYPE_TO_LABEL: Record<string, string> = {
+    list: "list",
+    "list:paired": "list of dataset pairs",
+    paired: "dataset pair",
+};
 
-interface SelectOption {
+type SelectOption = {
     label: string;
     value: DataOption | null;
-}
+};
 
 const props = withDefaults(
     defineProps<{
@@ -31,7 +50,8 @@ const props = withDefaults(
             values: Array<DataOption>;
         };
         extensions?: Array<string>;
-        type?: string;
+        type?: "data" | "data_collection";
+        collectionTypes?: Array<string>;
         flavor?: string;
         tag?: string;
     }>(),
@@ -39,17 +59,19 @@ const props = withDefaults(
         loading: false,
         multiple: false,
         optional: false,
-        value: null,
+        value: undefined,
         extensions: () => [],
         type: "data",
-        flavor: null,
-        tag: null,
+        collectionTypes: undefined,
+        flavor: undefined,
+        tag: undefined,
     }
 );
 
 const eventStore = useEventStore();
+const { datatypesMapper } = useDatatypesMapper();
 
-const $emit = defineEmits(["input"]);
+const $emit = defineEmits(["input", "alert"]);
 
 // Determines wether values should be processed as linked or unlinked
 const currentLinked = ref(true);
@@ -63,6 +85,19 @@ const currentHighlighting: Ref<string | null> = ref(null);
 // Drag/Drop related values
 const dragData: Ref<EventData | null> = ref(null);
 const dragTarget: Ref<EventTarget | null> = ref(null);
+
+// Collection creator modal settings
+const collectionModalShow = ref(false);
+const collectionModalType = ref<"list" | "list:paired" | "paired">("list");
+const { currentHistoryId } = storeToRefs(useHistoryStore());
+const restrictsExtensions = computed(() => {
+    const extensions = props.extensions;
+    if (!extensions || extensions.length == 0 || extensions.indexOf("data") >= 0) {
+        return false;
+    } else {
+        return true;
+    }
+});
 
 /** Store options which need to be preserved **/
 const keepOptions: Record<string, SelectOption> = {};
@@ -99,16 +134,27 @@ const currentValue = computed({
                 return value;
             }
         }
-        if (!props.optional && formattedOptions.value.length > 0) {
+        if (!currentVariant.value?.multiple && !props.optional && formattedOptions.value.length > 0) {
             const firstEntry = formattedOptions.value && formattedOptions.value[0];
             if (firstEntry && firstEntry.value) {
                 value.push(firstEntry.value);
                 return value;
             }
         }
-        return null;
+        return undefined;
     },
     set: (val) => {
+        if (val && Array.isArray(val) && val.length > 0) {
+            val.sort((a, b) => {
+                const aHid = a.hid;
+                const bHid = b.hid;
+                if (aHid && bHid) {
+                    return aHid - bHid;
+                } else {
+                    return 0;
+                }
+            });
+        }
         $emit("input", createValue(val));
     },
 });
@@ -219,7 +265,7 @@ function clearHighlighting(timeout = 1000) {
 /**
  * Create final input element value
  */
-function createValue(val: Array<DataOption> | DataOption | null) {
+function createValue(val?: Array<DataOption> | DataOption | null) {
     if (val) {
         const values = Array.isArray(val) ? val : [val];
         if (variant.value && values.length > 0 && values[0]) {
@@ -288,23 +334,54 @@ function getSourceType(val: DataOption) {
 function handleIncoming(incoming: Record<string, unknown>, partial = true) {
     if (incoming) {
         const values = Array.isArray(incoming) ? incoming : [incoming];
+        const extensions = values.map((v) => v.extension || v.elements_datatypes).filter((v) => (v ? true : false));
+        if (!canAcceptDatatype(extensions)) {
+            return false;
+        }
+        if (values.some((v) => !canAcceptSrc(v.history_content_type, v.collection_type))) {
+            return false;
+        }
         if (values.length > 0) {
             const incomingValues: Array<DataOption> = [];
             values.forEach((v) => {
                 // Map incoming objects to data option values
+                let newSrc;
+                if (isDCE(v)) {
+                    if (isDatasetElement(v)) {
+                        newSrc = SOURCE.DATASET;
+                        v = v.object;
+                    } else {
+                        newSrc = SOURCE.COLLECTION_ELEMENT;
+                    }
+                } else {
+                    newSrc =
+                        v.src || (v.history_content_type === "dataset_collection" ? SOURCE.COLLECTION : SOURCE.DATASET);
+                }
                 const newHid = v.hid;
                 const newId = v.id;
                 const newName = v.name ? v.name : newId;
-                const newSrc =
-                    v.src || (v.history_content_type === "dataset_collection" ? SOURCE.COLLECTION : SOURCE.DATASET);
-                const newValue = {
+                const newValue: DataOption = {
                     id: newId,
                     src: newSrc,
+                    batch: false,
+                    map_over_type: undefined,
                     hid: newHid,
                     name: newName,
                     keep: true,
                     tags: [],
                 };
+                if (v.collection_type && props.collectionTypes?.length > 0) {
+                    if (!props.collectionTypes.includes(v.collection_type)) {
+                        const mapOverType = props.collectionTypes.find((collectionType) =>
+                            v.collection_type.endsWith(collectionType)
+                        );
+                        if (!mapOverType) {
+                            return false;
+                        }
+                        newValue["batch"] = true;
+                        newValue["map_over_type"] = mapOverType;
+                    }
+                }
                 // Verify that new value has corresponding option
                 const keepKey = `${newId}_${newSrc}`;
                 const existingOptions = props.options && props.options[newSrc];
@@ -335,6 +412,7 @@ function handleIncoming(incoming: Record<string, unknown>, partial = true) {
             }
         }
     }
+    return true;
 }
 
 /**
@@ -358,12 +436,103 @@ function onBrowse() {
     }
 }
 
-/**
- * Drag/Drop event handlers
- */
+function canAcceptDatatype(itemDatatypes: string | Array<string>) {
+    if (!(props.extensions?.length > 0) || props.extensions.includes("data")) {
+        return true;
+    }
+    let datatypes: Array<string>;
+    if (!Array.isArray(itemDatatypes)) {
+        datatypes = [itemDatatypes];
+    } else {
+        datatypes = itemDatatypes;
+    }
+    const incompatibleItem = datatypes.find(
+        (extension) => !datatypesMapper.value?.isSubTypeOfAny(extension, props.extensions)
+    );
+    if (incompatibleItem) {
+        return false;
+    }
+    return true;
+}
+
+function canAcceptSrc(historyContentType: "dataset" | "dataset_collection", collectionType?: string) {
+    if (historyContentType === "dataset") {
+        // HDA can only be fed into data parameters, not collection parameters
+        if (props.type === "data") {
+            return true;
+        } else {
+            $emit("alert", "dataset is not a valid input for dataset collection parameter.");
+            return false;
+        }
+    } else if (historyContentType === "dataset_collection") {
+        if (props.type === "data") {
+            // collection can always be mapped over a data input ... in theory.
+            // One day we should also validate the map over model
+            return true;
+        }
+        if (!collectionType) {
+            // Should always be set if item is dataset collection
+            throw Error("Item is a dataset collection of unknown type.");
+        } else if (!props.collectionTypes) {
+            // if no collection_type is set all collections are valid
+            return true;
+        } else {
+            if (props.collectionTypes.includes(collectionType)) {
+                return true;
+            }
+            if (props.collectionTypes.some((element) => collectionType.endsWith(element))) {
+                return true;
+            } else {
+                $emit(
+                    "alert",
+                    `${collectionType} dataset collection is not a valid input for ${orList(
+                        props.collectionTypes
+                    )} type dataset collection parameter.`
+                );
+                return false;
+            }
+        }
+    } else {
+        throw Error("Unknown history content type.");
+    }
+}
+
+/** Allowed collection types for collection creation */
+const effectiveCollectionTypes = props.collectionTypes?.filter((collectionType) =>
+    ["list", "list:paired", "paired"].includes(collectionType)
+);
+
+function buildNewCollection(collectionType: string) {
+    if (!["list", "list:paired", "paired"].includes(collectionType)) {
+        throw Error(`Unknown collection type: ${collectionType}`);
+    }
+    collectionModalType.value = collectionType as "list" | "list:paired" | "paired";
+    collectionModalShow.value = true;
+}
+
+function createdCollection(collection: any) {
+    handleIncoming(collection);
+}
+
+// Drag/Drop event handlers
 function onDragEnter(evt: MouseEvent) {
     const eventData = eventStore.getDragData();
     if (eventData) {
+        const extensions = (eventData.extension as string) || (eventData.elements_datatypes as Array<string>);
+        let highlightingState = "success";
+        if (!canAcceptDatatype(extensions)) {
+            highlightingState = "warning";
+            $emit("alert", `${extensions} is not an acceptable format for this parameter.`);
+        } else if (
+            !canAcceptSrc(
+                eventData.history_content_type as "dataset" | "dataset_collection",
+                eventData.collection_type as string
+            )
+        ) {
+            highlightingState = "warning";
+            $emit("alert", `${eventData.history_content_type} is not an acceptable input type for this parameter.`);
+        }
+        currentHighlighting.value = highlightingState;
         dragTarget.value = evt.target;
         dragData.value = eventData;
     }
@@ -372,19 +541,24 @@ function onDragEnter(evt: MouseEvent) {
 function onDragLeave(evt: MouseEvent) {
     if (dragTarget.value === evt.target) {
         currentHighlighting.value = null;
-    }
-}
-
-function onDragOver() {
-    if (dragData.value !== null) {
-        currentHighlighting.value = "warning";
+        $emit("alert", undefined);
     }
 }
 
 function onDrop() {
     if (dragData.value) {
-        handleIncoming(dragData.value);
-        currentHighlighting.value = "success";
+        let accept = false;
+        if (eventStore.multipleDragData) {
+            accept = handleIncoming(Object.values(dragData.value) as any, false);
+        } else {
+            accept = handleIncoming(dragData.value);
+        }
+        if (accept) {
+            currentHighlighting.value = "success";
+        } else {
+            currentHighlighting.value = "warning";
+        }
+        $emit("alert", undefined);
         dragData.value = null;
         clearHighlighting();
     }
@@ -401,7 +575,10 @@ const matchedValues = computed(() => {
                 const options = props.options[entry.src] || [];
                 const option = options.find((v) => v.id === entry.id && v.src === entry.src);
                 if (option) {
-                    values.push({ ...option, name: option.name || entry.id });
+                    const accepted = !props.tag || option.tags?.includes(props.tag);
+                    if (accepted) {
+                        values.push({ ...option, name: option.name || entry.id });
+                    }
                 }
             }
         });
@@ -410,7 +587,7 @@ const matchedValues = computed(() => {
 });
 
 onMounted(() => {
-    if (props.value) {
+    if (props.value && matchedValues.value.length > 0) {
         $emit("input", createValue(matchedValues.value));
     } else {
         $emit("input", createValue(currentValue.value));
@@ -426,68 +603,178 @@ watch(
         $emit("input", createValue(currentValue.value));
     }
 );
+
+const formatsVisible = ref(false);
+const formatsButtonId = useUid("form-data-formats-");
+
+function collectionTypeToText(collectionType: string): string {
+    if (collectionType == "list:paired") {
+        return "list of pairs";
+    } else {
+        return collectionType;
+    }
+}
+
+const warningListAmount = 4;
+const noOptionsWarningMessage = computed(() => {
+    const itemType = props.type === "data" ? "datasets" : "dataset collections";
+    const collectionTypeLabel = props.collectionTypes?.length
+        ? `${orList(props.collectionTypes.map(collectionTypeToText))} `
+        : "";
+    if (!props.extensions || props.extensions.length === 0 || props.extensions.includes("data")) {
+        return `No ${collectionTypeLabel}${itemType} available`;
+    } else if (props.extensions.length <= warningListAmount) {
+        return `No ${collectionTypeLabel}${itemType} with ${orList(props.extensions)} elements available`;
+    } else {
+        return `No compatible ${collectionTypeLabel}${itemType} available`;
+    }
+});
 </script>
 
 <template>
+    <!-- eslint-disable-next-line vuejs-accessibility/no-static-element-interactions -->
     <div
+        class="form-data"
         :class="currentHighlighting && `ui-dragover-${currentHighlighting}`"
         @dragenter.prevent="onDragEnter"
         @dragleave.prevent="onDragLeave"
-        @dragover.prevent="onDragOver"
+        @dragover.prevent
         @drop.prevent="onDrop">
-        <div>
-            <div class="d-flex">
-                <BButtonGroup v-if="variant.length > 1" buttons class="align-self-start mr-2">
+        <div class="d-flex flex-column">
+            <BButtonGroup v-if="variant && variant.length > 1" buttons class="align-self-start">
+                <BButton
+                    v-for="(v, index) in variant"
+                    :key="index"
+                    v-b-tooltip.hover.bottom
+                    :pressed="currentField === index"
+                    :title="v.tooltip"
+                    @click="currentField = index">
+                    <FontAwesomeIcon :icon="['far', v.icon]" />
+                </BButton>
+                <BButton v-if="canBrowse" v-b-tooltip.hover.bottom title="Browse or Upload Datasets" @click="onBrowse">
+                    <FontAwesomeIcon v-if="loading" :icon="faSpinner" spin />
+                    <span v-else class="font-weight-bold">...</span>
+                </BButton>
+                <BButtonGroup v-if="effectiveCollectionTypes?.length > 0" size="sm" buttons>
                     <BButton
-                        v-for="(v, index) in variant"
-                        :key="index"
+                        v-for="collectionType in effectiveCollectionTypes"
+                        :key="collectionType"
                         v-b-tooltip.hover.bottom
-                        :pressed="currentField === index"
-                        :title="v.tooltip"
-                        @click="currentField = index">
-                        <FontAwesomeIcon :icon="['far', v.icon]" />
-                    </BButton>
-                    <BButton
-                        v-if="canBrowse"
-                        v-b-tooltip.hover.bottom
-                        title="Browse or Upload Datasets"
-                        @click="onBrowse">
-                        <FontAwesomeIcon v-if="loading" icon="fa-spinner" spin />
-                        <span v-else class="font-weight-bold">...</span>
+                        :title="`Create a new ${COLLECTION_TYPE_TO_LABEL[collectionType]}`"
+                        :variant="formattedOptions.length === 0 ? 'warning' : 'secondary'"
+                        @click="buildNewCollection(collectionType)">
+                        <FontAwesomeIcon :icon="faPlus" fixed-width />
                     </BButton>
                 </BButtonGroup>
-                <FormSelect
-                    v-if="currentVariant"
-                    v-model="currentValue"
-                    :multiple="currentVariant.multiple"
-                    :optional="optional"
-                    :options="formattedOptions"
-                    :placeholder="`Select a ${placeholder}`" />
-            </div>
-            <div v-if="currentVariant.batch !== BATCH.DISABLED">
-                <BFormCheckbox
-                    v-if="currentVariant.batch === BATCH.ENABLED"
-                    v-model="currentLinked"
-                    class="no-highlight my-2"
-                    switch>
-                    <span v-if="currentLinked">
-                        <FontAwesomeIcon icon="fa-link" />
-                        <b v-localize class="mr-1">Linked:</b>
-                        <span v-localize>Datasets will be run in matched order with other datasets.</span>
-                    </span>
-                    <span v-else>
-                        <FontAwesomeIcon icon="fa-unlink" />
-                        <b v-localize class="mr-1">Unlinked:</b>
-                        <span v-localize>Dataset will be run against *all* other datasets.</span>
-                    </span>
-                </BFormCheckbox>
-                <div class="text-info my-2">
-                    <FontAwesomeIcon icon="fa-exclamation" />
-                    <span v-localize class="ml-1">
-                        This is a batch mode input field. Individual jobs will be triggered for each dataset.
-                    </span>
-                </div>
+            </BButtonGroup>
+            <div v-if="restrictsExtensions">
+                <BButton :id="formatsButtonId" class="ui-link" @click="formatsVisible = !formatsVisible">
+                    accepted formats
+                    <FontAwesomeIcon v-if="formatsVisible" :icon="faCaretUp" />
+                    <FontAwesomeIcon v-else :icon="faCaretDown" />
+                </BButton>
+                <BCollapse v-model="formatsVisible">
+                    <ul class="pl-3 m-0">
+                        <li v-for="extension in extensions" :key="extension">{{ extension }}</li>
+                    </ul>
+                </BCollapse>
+                <BTooltip :target="formatsButtonId" noninteractive placement="bottom" triggers="hover">
+                    <div class="form-data-extensions-tooltip">
+                        <span v-for="extension in extensions" :key="extension">{{ extension }}</span>
+                    </div>
+                </BTooltip>
             </div>
         </div>
+
+        <FormSelect
+            v-if="currentVariant && !currentVariant.multiple"
+            v-model="currentValue"
+            class="align-self-start"
+            :multiple="currentVariant.multiple"
+            :optional="currentVariant.multiple || optional"
+            :options="formattedOptions"
+            :placeholder="`Select a ${placeholder}`">
+            <template v-slot:no-options>
+                <BAlert class="w-100 align-items-center" variant="warning" show>
+                    {{ noOptionsWarningMessage }}
+                </BAlert>
+            </template>
+        </FormSelect>
+        <FormSelection
+            v-else-if="currentVariant?.multiple"
+            v-model="currentValue"
+            :data="formattedOptions"
+            optional
+            multiple />
+
+        <CollectionCreatorModal
+            v-if="currentHistoryId && effectiveCollectionTypes?.length > 0"
+            :history-id="currentHistoryId"
+            :collection-type="collectionModalType"
+            :extensions="props.extensions.filter((ext) => ext !== 'data')"
+            :show-modal.sync="collectionModalShow"
+            @created-collection="createdCollection" />
+
+        <template v-if="currentVariant && currentVariant.batch !== BATCH.DISABLED">
+            <BFormCheckbox
+                v-if="currentVariant.batch === BATCH.ENABLED"
+                v-model="currentLinked"
+                class="checkbox no-highlight"
+                switch>
+                <span v-if="currentLinked">
+                    <FontAwesomeIcon :icon="faLink" />
+                    <b v-localize class="mr-1">Linked:</b>
+                    <span v-localize>Datasets will be run in matched order with other datasets.</span>
+                </span>
+                <span v-else>
+                    <FontAwesomeIcon :icon="faUnlink" />
+                    <b v-localize class="mr-1">Unlinked:</b>
+                    <span v-localize>Dataset will be run against *all* other datasets.</span>
+                </span>
+            </BFormCheckbox>
+            <div class="info text-info">
+                <FontAwesomeIcon :icon="faExclamation" />
+                <span v-if="props.type == 'data' && currentVariant.src == SOURCE.COLLECTION" class="ml-1">
+                    The supplied input will be <HelpText text="mapped over" uri="galaxy.collections.mapOver" /> this
+                    tool.
+                </span>
+                <span v-else v-localize class="ml-1">
+                    This is a batch mode input field. Individual jobs will be triggered for each dataset.
+                </span>
+            </div>
+        </template>
     </div>
 </template>
+
+<style scoped lang="scss">
+.form-data {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 0.5rem;
+
+    .checkbox {
+        grid-column: span 2;
+    }
+
+    .info {
+        grid-column: span 2;
+    }
+}
+</style>
+
+<style lang="scss">
+.form-data-extensions-tooltip {
+    display: flex;
+    flex-wrap: wrap;
+    column-gap: 0.25rem;
+    font-size: 0.8rem;
+
+    span::after {
+        content: ", ";
+    }
+
+    span:last-child::after {
+        content: none;
+    }
+}
+</style>

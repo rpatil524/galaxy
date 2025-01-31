@@ -3,7 +3,6 @@ import logging
 import time
 
 import jwt
-import requests
 from msal import ConfidentialClientApplication
 from social_core.actions import (
     do_auth,
@@ -26,8 +25,10 @@ from galaxy.model import (
     PSAPartial,
     UserAuthnzToken,
 )
-from galaxy.model.base import transaction
-from galaxy.util import DEFAULT_SOCKET_TIMEOUT
+from galaxy.util import (
+    DEFAULT_SOCKET_TIMEOUT,
+    requests,
+)
 from . import IdentityProvider
 
 log = logging.getLogger(__name__)
@@ -42,6 +43,8 @@ BACKENDS = {
     "elixir": "social_core.backends.elixir.ElixirOpenIdConnect",
     "okta": "social_core.backends.okta_openidconnect.OktaOpenIdConnect",
     "azure": "social_core.backends.azuread_tenant.AzureADV2TenantOAuth2",
+    "egi_checkin": "social_core.backends.egi_checkin.EGICheckinOpenIdConnect",
+    "oidc": "social_core.backends.open_id_connect.OpenIdConnectAuth",
 }
 
 BACKENDS_NAME = {
@@ -50,6 +53,8 @@ BACKENDS_NAME = {
     "elixir": "elixir",
     "okta": "okta-openidconnect",
     "azure": "azuread-v2-tenant-oauth2",
+    "egi_checkin": "egi-checkin",
+    "oidc": "oidc",
 }
 
 AUTH_PIPELINE = (
@@ -131,6 +136,8 @@ class PSAAuthnz(IdentityProvider):
         self.config["TENANT_ID"] = oidc_backend_config.get("tenant_id")
         self.config["redirect_uri"] = oidc_backend_config.get("redirect_uri")
         self.config["EXTRA_SCOPES"] = oidc_backend_config.get("extra_scopes")
+        if oidc_backend_config.get("oidc_endpoint"):
+            self.config["OIDC_ENDPOINT"] = oidc_backend_config["oidc_endpoint"]
         if oidc_backend_config.get("prompt") is not None:
             self.config[setting_name("AUTH_EXTRA_ARGUMENTS")]["prompt"] = oidc_backend_config.get("prompt")
         if oidc_backend_config.get("api_url") is not None:
@@ -189,7 +196,7 @@ class PSAAuthnz(IdentityProvider):
             return True
         return False
 
-    def authenticate(self, trans):
+    def authenticate(self, trans, idphint=None):
         on_the_fly_config(trans.sa_session)
         strategy = Strategy(trans.request, trans.session, Storage, self.config)
         backend = self._load_backend(strategy, self.config["redirect_uri"])
@@ -220,7 +227,7 @@ class PSAAuthnz(IdentityProvider):
 
         return redirect_url, self.config.get("user", None)
 
-    def disconnect(self, provider, trans, disconnect_redirect_url=None, association_id=None):
+    def disconnect(self, provider, trans, disconnect_redirect_url=None, email=None, association_id=None):
         on_the_fly_config(trans.sa_session)
         self.config[setting_name("DISCONNECT_REDIRECT_URL")] = (
             disconnect_redirect_url if disconnect_redirect_url is not None else ()
@@ -486,5 +493,4 @@ def disconnect(
     sa_session.delete(user_authnz)
     # option B
     # user_authnz.extra_data = None
-    with transaction(sa_session):
-        sa_session.commit()
+    sa_session.commit()

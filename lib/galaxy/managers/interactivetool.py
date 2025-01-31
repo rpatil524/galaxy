@@ -1,14 +1,22 @@
 import json
 import logging
-import sqlite3
 from urllib.parse import (
     urlsplit,
     urlunsplit,
 )
 
 from sqlalchemy import (
+    Column,
+    create_engine,
+    delete,
+    insert,
+    Integer,
+    MetaData,
     or_,
     select,
+    String,
+    Table,
+    Text,
 )
 
 from galaxy import exceptions
@@ -16,99 +24,68 @@ from galaxy.model import (
     InteractiveToolEntryPoint,
     Job,
 )
-from galaxy.model.base import transaction
 from galaxy.security.idencoding import IdAsLowercaseAlphanumEncodingHelper
-from galaxy.util.filelock import FileLock
 
 log = logging.getLogger(__name__)
 
-DATABASE_TABLE_NAME = "gxitproxy"
+gxitproxy = Table(
+    "gxitproxy",
+    MetaData(),
+    Column("key", String(16), primary_key=True),
+    Column("key_type", Text(), primary_key=True),
+    Column("token", String(32)),
+    Column("host", Text()),
+    Column("port", Integer()),
+    Column("info", Text()),
+)
 
 
-class InteractiveToolSqlite:
-    def __init__(self, sqlite_filename, encode_id):
-        self.sqlite_filename = sqlite_filename
-        self.encode_id = encode_id
+class InteractiveToolPropagatorSQLAlchemy:
+    """
+    Propagator for InteractiveToolManager implemented using SQLAlchemy.
+    """
 
-    def get(self, key, key_type):
-        with FileLock(self.sqlite_filename):
-            conn = sqlite3.connect(self.sqlite_filename)
-            try:
-                c = conn.cursor()
-                select = f"""SELECT token, host, port, info
-                            FROM {DATABASE_TABLE_NAME}
-                            WHERE key=? and key_type=?"""
-                c.execute(
-                    select,
-                    (
-                        key,
-                        key_type,
-                    ),
-                )
-                try:
-                    token, host, port, info = c.fetchone()
-                except TypeError:
-                    log.warning("get(): invalid key: %s key_type %s", key, key_type)
-                    return None
-                return dict(key=key, key_type=key_type, token=token, host=host, port=port, info=info)
-            finally:
-                conn.close()
+    def __init__(self, database_url, encode_id):
+        """
+        Constructor that sets up the propagator using a SQLAlchemy database URL.
+
+        :param database_url: SQLAlchemy database URL, read more on the SQLAlchemy documentation
+                             https://docs.sqlalchemy.org/en/20/core/engines.html#database-urls.
+        :param encode_id: A helper class that can encode ids as lowercase alphanumeric strings and vice versa.
+        """
+        self._engine = create_engine(database_url)
+        self._encode_id = encode_id
 
     def save(self, key, key_type, token, host, port, info=None):
         """
-        Writeout a key, key_type, token, value store that is can be used for coordinating
-        with external resources.
+        Write out a key, key_type, token, value store that is can be used for coordinating with external resources.
         """
         assert key, ValueError("A non-zero length key is required.")
         assert key_type, ValueError("A non-zero length key_type is required.")
         assert token, ValueError("A non-zero length token is required.")
-        with FileLock(self.sqlite_filename):
-            conn = sqlite3.connect(self.sqlite_filename)
-            try:
-                c = conn.cursor()
-                try:
-                    # Create table
-                    c.execute(
-                        """CREATE TABLE %s
-                                 (key text,
-                                  key_type text,
-                                  token text,
-                                  host text,
-                                  port integer,
-                                  info text,
-                                  PRIMARY KEY (key, key_type)
-                                  )"""
-                        % (DATABASE_TABLE_NAME)
-                    )
-                except Exception:
-                    pass
-                delete = f"""DELETE FROM {DATABASE_TABLE_NAME} WHERE key=? and key_type=?"""
-                c.execute(
-                    delete,
-                    (
-                        key,
-                        key_type,
-                    ),
-                )
-                insert = """INSERT INTO %s
-                            (key, key_type, token, host, port, info)
-                            VALUES (?, ?, ?, ?, ?, ?)""" % (
-                    DATABASE_TABLE_NAME
-                )
-                c.execute(
-                    insert,
-                    (
-                        key,
-                        key_type,
-                        token,
-                        host,
-                        port,
-                        info,
-                    ),
-                )
-                conn.commit()
-            finally:
-                conn.close()
+        with self._engine.connect() as conn:
+            # create database table if not exists
+            gxitproxy.create(conn, checkfirst=True)
+
+            # delete existing data with same key
+            stmt_delete = delete(gxitproxy).where(
+                gxitproxy.c.key == key,
+                gxitproxy.c.key_type == key_type,
+            )
+            conn.execute(stmt_delete)
+
+            # save data
+            stmt_insert = insert(gxitproxy).values(
+                key=key,
+                key_type=key_type,
+                token=token,
+                host=host,
+                port=port,
+                info=info,
+            )
+            conn.execute(stmt_insert)
+
+            conn.commit()
 
     def remove(self, **kwd):
         """
@@ -116,30 +93,17 @@ class InteractiveToolSqlite:
         with external resources. Remove entries that match all provided key=values
         """
         assert kwd, ValueError("You must provide some values to key upon")
-        delete = f"DELETE FROM {DATABASE_TABLE_NAME} WHERE"
-        value_list = []
-        for i, (key, value) in enumerate(kwd.items()):
-            if i != 0:
-                delete += " and"
-            delete += f" {key}=?"
-            value_list.append(value)
-        with FileLock(self.sqlite_filename):
-            conn = sqlite3.connect(self.sqlite_filename)
-            try:
-                c = conn.cursor()
-                try:
-                    # Delete entry
-                    c.execute(delete, tuple(value_list))
-                except Exception as e:
-                    log.debug("Error removing entry (%s): %s", delete, e)
-                conn.commit()
-            finally:
-                conn.close()
+        with self._engine.connect() as conn:
+            stmt = delete(gxitproxy).where(
+                *(gxitproxy.c[key] == value for key, value in kwd.items()),
+            )
+            conn.execute(stmt)
+            conn.commit()
 
     def save_entry_point(self, entry_point):
         """Convenience method to easily save an entry_point."""
         return self.save(
-            self.encode_id(entry_point.id),
+            self._encode_id(entry_point.id),
             entry_point.__class__.__name__.lower(),
             entry_point.token,
             entry_point.host,
@@ -154,7 +118,7 @@ class InteractiveToolSqlite:
 
     def remove_entry_point(self, entry_point):
         """Convenience method to easily remove an entry_point."""
-        return self.remove(key=self.encode_id(entry_point.id), key_type=entry_point.__class__.__name__.lower())
+        return self.remove(key=self._encode_id(entry_point.id), key_type=entry_point.__class__.__name__.lower())
 
 
 class InteractiveToolManager:
@@ -169,7 +133,10 @@ class InteractiveToolManager:
         self.sa_session = app.model.context
         self.job_manager = app.job_manager
         self.encoder = IdAsLowercaseAlphanumEncodingHelper(app.security)
-        self.propagator = InteractiveToolSqlite(app.config.interactivetools_map, self.encoder.encode_id)
+        self.propagator = InteractiveToolPropagatorSQLAlchemy(
+            app.config.interactivetoolsproxy_map or app.config.interactivetools_map,
+            self.encoder.encode_id,
+        )
 
     def create_entry_points(self, job, tool, entry_points=None, flush=True):
         entry_points = entry_points or tool.ports
@@ -186,8 +153,7 @@ class InteractiveToolManager:
             )
             self.sa_session.add(ep)
         if flush:
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
 
     def configure_entry_point(self, job, tool_port=None, host=None, port=None, protocol=None):
         return self.configure_entry_points(
@@ -212,8 +178,7 @@ class InteractiveToolManager:
                 self.save_entry_point(ep)
                 configured.append(ep)
         if configured:
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
         return dict(not_configured=not_configured, configured=configured)
 
     def save_entry_point(self, entry_point):
@@ -243,8 +208,8 @@ class InteractiveToolManager:
             filters = []
             for state in Job.non_ready_states:
                 filters.append(Job.state == state)
-            stmt = stmt.where(or_(*filters)).subquery()
-            return stmt
+            stmt = stmt.where(or_(*filters))
+            return stmt.subquery()
 
         stmt = select(InteractiveToolEntryPoint).where(InteractiveToolEntryPoint.job_id.in_(build_subquery()))
         return trans.sa_session.scalars(stmt)
@@ -281,22 +246,19 @@ class InteractiveToolManager:
             # This self.job_manager.stop(job) does nothing without changing job.state, manually or e.g. with .mark_deleted()
             self.job_manager.stop(job)
             trans.sa_session.add(job)
-            with transaction(trans.sa_session):
-                trans.sa_session.commit()
+            trans.sa_session.commit()
 
     def remove_entry_points(self, entry_points):
         if entry_points:
             for entry_point in entry_points:
                 self.remove_entry_point(entry_point, flush=False)
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
 
     def remove_entry_point(self, entry_point, flush=True):
         entry_point.deleted = True
         self.sa_session.add(entry_point)
         if flush:
-            with transaction(self.sa_session):
-                self.sa_session.commit()
+            self.sa_session.commit()
         self.propagator.remove_entry_point(entry_point)
 
     def target_if_active(self, trans, entry_point):

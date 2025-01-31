@@ -70,10 +70,9 @@ class ToolValidator:
                                 sample_found = True
                                 break
                         if not sample_found:
-                            correction_msg = f"This file refers to a file named <b>{str(index_file_name)}</b>.  "
-                            correction_msg += (
-                                "Upload a file named <b>%s.sample</b> to the repository to correct this error."
-                                % str(index_file_name)
+                            correction_msg = (
+                                f"This file refers to a file named <b>{index_file_name}</b>.  "
+                                f"Upload a file named <b>{index_file_name}.sample</b> to the repository to correct this error."
                             )
                             invalid_files_and_errors_tups.append((tool_config_name, correction_msg))
         return invalid_files_and_errors_tups
@@ -98,7 +97,7 @@ class ToolValidator:
             tool = None
             valid = False
             error_message = (
-                f'This file requires an entry for "{str(e)}" in the tool_data_table_conf.xml file.  Upload a file '
+                f'This file requires an entry for "{str(e)}" in the tool_data_table_conf.xml file. Upload a file '
             )
             error_message += (
                 "named tool_data_table_conf.xml.sample to the repository that includes the required entry to correct "

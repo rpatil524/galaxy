@@ -24,6 +24,7 @@ localVue.use(PiniaVuePlugin);
 
 function testActivity(id, newOptions = {}) {
     const defaultOptions = {
+        anonymous: true,
         id: `test-${id}`,
         description: "test-description",
         icon: "test-icon",
@@ -44,7 +45,7 @@ describe("ActivityBar", () => {
 
     beforeEach(async () => {
         const pinia = createTestingPinia({ stubActions: false });
-        activityStore = useActivityStore();
+        activityStore = useActivityStore("default");
         eventStore = useEventStore();
         wrapper = shallowMount(mountTarget, {
             localVue,

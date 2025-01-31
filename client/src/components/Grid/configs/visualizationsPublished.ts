@@ -1,11 +1,11 @@
-import { fetcher } from "@/api/schema";
+import { faEye } from "@fortawesome/free-solid-svg-icons";
+
+import { GalaxyApi } from "@/api";
 import Filtering, { contains, expandNameTag, type ValidFilter } from "@/utils/filtering";
 import { withPrefix } from "@/utils/redirect";
+import { rethrowSimple } from "@/utils/simple-error";
 
-/**
- * Api endpoint handlers
- */
-const getVisualizations = fetcher.path("/api/visualizations").method("get").create();
+import { type FieldArray, type GridConfig } from "./types";
 
 /**
  * Local types
@@ -17,32 +17,51 @@ type VisualizationEntry = Record<string, unknown>;
  * Request and return data from server
  */
 async function getData(offset: number, limit: number, search: string, sort_by: string, sort_desc: boolean) {
-    const { data, headers } = await getVisualizations({
-        limit,
-        offset,
-        search,
-        sort_by: sort_by as SortKeyLiteral,
-        sort_desc,
-        show_own: false,
-        show_published: true,
-        show_shared: true,
+    const { response, data, error } = await GalaxyApi().GET("/api/visualizations", {
+        params: {
+            query: {
+                limit,
+                offset,
+                search,
+                sort_by: sort_by as SortKeyLiteral,
+                sort_desc,
+                show_own: false,
+                show_published: true,
+                show_shared: true,
+            },
+        },
     });
-    const totalMatches = parseInt(headers.get("total_matches") ?? "0");
+
+    if (error) {
+        rethrowSimple(error);
+    }
+
+    const totalMatches = parseInt(response.headers.get("total_matches") ?? "0");
     return [data, totalMatches];
 }
 
 /**
  * Declare columns to be displayed
  */
-const fields = [
+const fields: FieldArray = [
     {
         title: "Title",
         key: "title",
-        type: "link",
-        width: "30%",
-        handler: (data: VisualizationEntry) => {
-            window.location.href = withPrefix(`/plugins/visualizations/${data.type}/saved?id=${data.id}`);
-        },
+        type: "operations",
+        width: 40,
+        operations: [
+            {
+                title: "View",
+                icon: faEye,
+                handler: (data: VisualizationEntry) => {
+                    if (data.type === "trackster") {
+                        window.location.href = withPrefix(`/visualization/${data.type}?id=${data.id}`);
+                    } else {
+                        window.location.href = withPrefix(`/plugins/visualizations/${data.type}/saved?id=${data.id}`);
+                    }
+                },
+            },
+        ],
     },
     {
         key: "annotation",
@@ -84,7 +103,8 @@ const validFilters: Record<string, ValidFilter<string | boolean | undefined>> = 
 /**
  * Grid configuration
  */
-export default {
+const gridConfig: GridConfig = {
+    id: "visualizations-published-grid",
     fields: fields,
     filtering: new Filtering(validFilters, undefined, false, false),
     getData: getData,
@@ -94,3 +114,5 @@ export default {
     sortKeys: ["create_time", "title", "update_time"],
     title: "Published Visualizations",
 };
+
+export default gridConfig;

@@ -1,15 +1,14 @@
 import logging
 from typing import (
-    cast,
     List,
     NamedTuple,
     Optional,
+    Tuple,
 )
 
 from typing_extensions import Unpack
 
-from galaxy.exceptions import AuthenticationRequired
-from galaxy.files import ProvidesUserFileSourcesUserContext
+from galaxy.files import OptionalUserContext
 from galaxy.files.sources import (
     BaseFilesSource,
     FilesSourceProperties,
@@ -20,17 +19,17 @@ from galaxy.files.sources import (
 
 log = logging.getLogger(__name__)
 
-OptionalUserContext = Optional[ProvidesUserFileSourcesUserContext]
-
 
 class RDMFilesSourceProperties(FilesSourceProperties):
-    url: str
     token: str
+    public_name: str
 
 
-class RecordFilename(NamedTuple):
-    record_id: str
-    filename: str
+class ContainerAndFileIdentifier(NamedTuple):
+    """The file_identifier could be a filename or a file_id."""
+
+    container_id: str
+    file_identifier: str
 
 
 class RDMRepositoryInteractor:
@@ -38,6 +37,10 @@ class RDMRepositoryInteractor:
 
     This class is not intended to be used directly, but rather to be subclassed
     by file sources that interact with RDM repositories.
+
+    Different RDM repositories use different terminology. Also they use the same term for different things.
+    To prevent confusion, we use the term "container" in the base repository.
+    This is an abstract term for the entity that contains multiple files.
     """
 
     def __init__(self, repository_url: str, plugin: "RDMFilesSource"):
@@ -57,59 +60,72 @@ class RDMRepositoryInteractor:
         """
         return self._repository_url
 
-    def to_plugin_uri(self, record_id: str, filename: Optional[str] = None) -> str:
-        """Creates a valid plugin URI to reference the given record_id.
+    def to_plugin_uri(self, container_id: str, filename: Optional[str] = None) -> str:
+        """Creates a valid plugin URI to reference the given container_id.
 
-        If a filename is provided, the URI will reference the specific file in the record."""
+        If a filename is provided, the URI will reference the specific file in the container."""
         raise NotImplementedError()
 
-    def get_records(self, writeable: bool, user_context: OptionalUserContext = None) -> List[RemoteDirectory]:
-        """Returns the list of records in the repository.
+    def get_file_containers(
+        self,
+        writeable: bool,
+        user_context: OptionalUserContext = None,
+        limit: Optional[int] = None,
+        offset: Optional[int] = None,
+        query: Optional[str] = None,
+        sort_by: Optional[str] = None,
+    ) -> Tuple[List[RemoteDirectory], int]:
+        """Returns the list of file containers in the repository and the total count containers.
 
-        If writeable is True, only records that the user can write to will be returned.
+        If writeable is True, only containers that the user can write to will be returned.
         The user_context might be required to authenticate the user in the repository.
         """
         raise NotImplementedError()
 
-    def get_files_in_record(
-        self, record_id: str, writeable: bool, user_context: OptionalUserContext = None
+    def get_files_in_container(
+        self,
+        container_id: str,
+        writeable: bool,
+        user_context: OptionalUserContext = None,
+        query: Optional[str] = None,
     ) -> List[RemoteFile]:
-        """Returns the list of files contained in the given record.
+        """Returns the list of files of a file container.
 
-        If writeable is True, we are signaling that the user intends to write to the record.
+        If writeable is True, we are signaling that the user intends to write to the container.
         """
         raise NotImplementedError()
 
-    def create_draft_record(self, title: str, user_context: OptionalUserContext = None):
-        """Creates a draft record (directory) in the repository with basic metadata.
+    def create_draft_file_container(self, title: str, public_name: str, user_context: OptionalUserContext = None):
+        """Creates a draft file container in the repository with basic metadata.
 
-        The metadata is usually just the title of the record and the user that created it.
+        The metadata is usually just the title of the container and the user that created it.
         Some plugins might also provide additional metadata defaults in the user settings."""
         raise NotImplementedError()
 
-    def upload_file_to_draft_record(
+    def upload_file_to_draft_container(
         self,
-        record_id: str,
+        container_id: str,
         filename: str,
         file_path: str,
         user_context: OptionalUserContext = None,
     ) -> None:
-        """Uploads a file with the provided filename (from file_path) to a draft record with the given record_id.
+        """Uploads a file with the provided filename (from file_path) to a draft container with the given container_id.
 
-        The draft record must have been created in advance with the `create_draft_record` method.
+        The draft container must have been created in advance with the `create_draft_file_container` method.
+
         The file must exist in the file system at the given file_path.
         The user_context might be required to authenticate the user in the repository.
         """
         raise NotImplementedError()
 
-    def download_file_from_record(
+    def download_file_from_container(
         self,
-        record_id: str,
-        filename: str,
+        container_id: str,
+        file_identifier: str,
         file_path: str,
         user_context: OptionalUserContext = None,
     ) -> None:
-        """Downloads a file with the provided filename from the record with the given record_id.
+        """Downloads a file with the provided filename from the container with the given container_id.
 
         The file will be downloaded to the file system at the given file_path.
         The user_context might be required to authenticate the user in the repository if the
@@ -125,34 +141,29 @@ class RDMFilesSource(BaseFilesSource):
     by file sources that interact with RDM repositories.
 
     A RDM file source is similar to a regular file source, but instead of tree of
-    files and directories, it provides a (one level) list of records (representing directories)
+    files and directories, it provides a (one level) list of containers
     that can contain only files (no subdirectories).
 
-    In addition, RDM file sources might need to create a new record (directory) in advance in the
-    repository, and then upload a file to it. This is done by calling the `create_entry`
-    method.
-
+    In addition, RDM file sources might need to create a new container in advance in the
+    repository, and then upload a file to it. This is done by calling the `_create_entry` method.
     """
 
     plugin_kind = PluginKind.rdm
 
-    def __init__(self, **kwd: Unpack[FilesSourceProperties]):
+    def __init__(self, **kwd: Unpack[RDMFilesSourceProperties]):
         props = self._parse_common_config_opts(kwd)
-        base_url = props.get("url", None)
-        if not base_url:
+        self.url = props.get("url")
+        if not self.url:
             raise Exception("URL for RDM repository must be provided in configuration")
-        self._repository_url = base_url
-        self._token = props.get("token", None)
         self._props = props
-        self._repository_interactor = self.get_repository_interactor(base_url)
+        self._repository_interactor = self.get_repository_interactor(self.url)
 
     @property
     def repository(self) -> RDMRepositoryInteractor:
         return self._repository_interactor
 
-    @property
-    def token(self) -> Optional[str]:
-        return self._token if self._token and not self._token.startswith("$") else None
+    def get_url(self) -> Optional[str]:
+        return self.url
 
     def get_repository_interactor(self, repository_url: str) -> RDMRepositoryInteractor:
         """Returns an interactor compatible with the given repository URL.
@@ -160,55 +171,30 @@ class RDMFilesSource(BaseFilesSource):
         This must be implemented by subclasses."""
         raise NotImplementedError()
 
-    def parse_path(self, source_path: str, record_id_only: bool = False) -> RecordFilename:
-        """Parses the given source path and returns the record_id and filename.
+    def parse_path(self, source_path: str, container_id_only: bool = False) -> ContainerAndFileIdentifier:
+        """Parses the given source path and returns the container_id and filename.
 
-        The source path must have the format '/<record_id>/<file_name>'.
-        If record_id_only is True, the source path must have the format '/<record_id>' and an
-        empty filename will be returned.
-        """
+        If container_id_only is True, an empty filename will be returned.
 
-        def get_error_msg(details: str) -> str:
-            return f"Invalid source path: '{source_path}'. Expected format: '{expected_format}'. {details}"
+        This must be implemented by subclasses."""
+        raise NotImplementedError()
 
-        expected_format = "/<record_id>"
-        if not source_path.startswith("/"):
-            raise ValueError(get_error_msg("Must start with '/'."))
-        parts = source_path[1:].split("/", 2)
-        if record_id_only:
-            if len(parts) != 1:
-                raise ValueError(get_error_msg("Please provide the record_id only."))
-            return RecordFilename(record_id=parts[0], filename="")
-        expected_format = "/<record_id>/<file_name>"
-        if len(parts) < 2:
-            raise ValueError(get_error_msg("Please provide both the record_id and file_name."))
-        if len(parts) > 2:
-            raise ValueError(get_error_msg("Too many parts. Please provide the record_id and file_name only."))
-        record_id, file_name = parts
-        return RecordFilename(record_id=record_id, filename=file_name)
+    def get_container_id_from_path(self, source_path: str) -> str:
+        raise NotImplementedError()
 
-    def get_record_id_from_path(self, source_path: str) -> str:
-        return self.parse_path(source_path, record_id_only=True).record_id
-
-    def _serialization_props(self, user_context: OptionalUserContext = None) -> RDMFilesSourceProperties:
+    def _serialization_props(self, user_context: OptionalUserContext = None):
         effective_props = {}
         for key, val in self._props.items():
             effective_props[key] = self._evaluate_prop(val, user_context=user_context)
-        effective_props["url"] = self._repository_url
-        effective_props["token"] = self.safe_get_authorization_token(user_context)
-        return cast(RDMFilesSourceProperties, effective_props)
+        return effective_props
 
-    def get_authorization_token(self, user_context: OptionalUserContext) -> str:
-        token = self.token
-        if not token and user_context:
-            vault = user_context.user_vault if user_context else None
-            token = vault.read_secret(f"preferences/{self.id}/token") if vault else None
-        if token is None:
-            raise AuthenticationRequired(f"No authorization token provided in user's settings for '{self.label}'")
+    def get_authorization_token(self, user_context: OptionalUserContext) -> Optional[str]:
+        token = None
+        if user_context:
+            effective_props = self._serialization_props(user_context)
+            token = effective_props.get("token")
         return token
 
-    def safe_get_authorization_token(self, user_context: OptionalUserContext) -> Optional[str]:
-        try:
-            return self.get_authorization_token(user_context)
-        except AuthenticationRequired:
-            return None
+    def get_public_name(self, user_context: OptionalUserContext) -> Optional[str]:
+        effective_props = self._serialization_props(user_context)
+        return effective_props.get("public_name")

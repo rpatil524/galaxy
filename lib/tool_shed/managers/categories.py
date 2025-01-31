@@ -12,7 +12,6 @@ from galaxy import (
     exceptions,
     web,
 )
-from galaxy.model.base import transaction
 from tool_shed.context import ProvidesUserContext
 from tool_shed.structured_app import ToolShedApp
 from tool_shed.webapp.model import Category
@@ -39,8 +38,7 @@ class CategoryManager:
                 # Create the category
                 category = self.app.model.Category(name=name, description=description)
                 trans.sa_session.add(category)
-                with transaction(trans.sa_session):
-                    trans.sa_session.commit()
+                trans.sa_session.commit()
             return category
         else:
             raise exceptions.RequestParameterMissingException('Missing required parameter "name".')
@@ -59,9 +57,7 @@ class CategoryManager:
 
     def to_dict(self, category: Category) -> Dict[str, Any]:
         category_dict = category.to_dict(view="collection", value_mapper=get_value_mapper(self.app))
-        category_dict["repositories"] = self.app.repository_registry.viewable_repositories_and_suites_by_category.get(
-            category.name, 0
-        )
+        category_dict["repositories"] = category.active_repository_count()
         category_dict["url"] = web.url_for(
             controller="categories", action="show", id=self.app.security.encode_id(category.id)
         )

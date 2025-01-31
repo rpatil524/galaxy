@@ -19,8 +19,10 @@ from fastapi import (
 )
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-from galaxy.exceptions import InsufficientPermissionsException
-from galaxy.model.base import transaction
+from galaxy.exceptions import (
+    ActionInputError,
+    InsufficientPermissionsException,
+)
 from galaxy.webapps.galaxy.api import as_form
 from tool_shed.context import SessionRequestContext
 from tool_shed.managers.repositories import (
@@ -28,6 +30,7 @@ from tool_shed.managers.repositories import (
     can_update_repo,
     check_updates,
     create_repository,
+    ensure_can_manage,
     get_install_info,
     get_ordered_installable_revisions,
     get_repository_metadata_dict,
@@ -42,7 +45,10 @@ from tool_shed.managers.repositories import (
     upload_tar_and_set_metadata,
 )
 from tool_shed.structured_app import ToolShedApp
-from tool_shed.util.repository_util import get_repository_in_tool_shed
+from tool_shed.util.repository_util import (
+    get_repository_in_tool_shed,
+    update_validated_repository,
+)
 from tool_shed_client.schema import (
     CreateRepositoryRequest,
     DetailedRepository,
@@ -57,6 +63,7 @@ from tool_shed_client.schema import (
     RepositoryUpdateRequest,
     ResetMetadataOnRepositoryRequest,
     ResetMetadataOnRepositoryResponse,
+    UpdateRepositoryRequest,
     ValidRepostiroyUpdateMessage,
 )
 from . import (
@@ -189,7 +196,6 @@ class FastAPIRepositories:
         # fails 1020 if we try to use the model - I guess repository dependencies
         # are getting lost
         return as_dict
-        # return _hack_fastapi_4428(as_dict)
 
     @router.get(
         "/api_internal/repositories/{encoded_repository_id}/metadata",
@@ -201,10 +207,10 @@ class FastAPIRepositories:
         self,
         encoded_repository_id: str = RepositoryIdPathParam,
         downloadable_only: bool = DownloadableQueryParam,
-    ) -> dict:
+    ) -> RepositoryMetadata:
         recursive = True
         as_dict = get_repository_metadata_dict(self.app, encoded_repository_id, recursive, downloadable_only)
-        return _hack_fastapi_4428(as_dict)
+        return RepositoryMetadata(root=as_dict)
 
     @router.get(
         "/api/repositories/get_ordered_installable_revisions",
@@ -294,6 +300,28 @@ class FastAPIRepositories:
         repository = get_repository_in_tool_shed(self.app, encoded_repository_id)
         return to_detailed_model(self.app, repository)
 
+    @router.put(
+        "/api/repositories/{encoded_repository_id}",
+        operation_id="repositories__update_repository",
+    )
+    def update_repository(
+        self,
+        trans: SessionRequestContext = DependsOnTrans,
+        encoded_repository_id: str = RepositoryIdPathParam,
+        request: UpdateRepositoryRequest = Body(...),
+    ) -> DetailedRepository:
+        repository = get_repository_in_tool_shed(self.app, encoded_repository_id)
+        ensure_can_manage(trans, repository)
+
+        # may want to set some of these to null, so we're using the exclude_unset feature
+        # to just serialize the ones we want to use to a dictionary.
+        update_dictionary = request.model_dump(exclude_unset=True)
+        repo_result, message = update_validated_repository(trans, repository, **update_dictionary)
+        if repo_result is None:
+            raise ActionInputError(message)
+
+        return to_detailed_model(self.app, repository)
+
     @router.get(
         "/api/repositories/{encoded_repository_id}/permissions",
         operation_id="repositories__permissions",
@@ -324,8 +352,7 @@ class FastAPIRepositories:
         encoded_repository_id: str = RepositoryIdPathParam,
     ) -> List[str]:
         repository = get_repository_in_tool_shed(self.app, encoded_repository_id)
-        if not can_manage_repo(trans, repository):
-            raise InsufficientPermissionsException("You do not have permission to update this repository.")
+        ensure_can_manage(trans, repository)
         return trans.app.security_agent.usernames_that_can_push(repository)
 
     @router.post(
@@ -358,8 +385,7 @@ class FastAPIRepositories:
         repository_metadata = get_repository_metadata_for_management(trans, encoded_repository_id, changeset_revision)
         repository_metadata.malicious = True
         trans.sa_session.add(repository_metadata)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.delete(
@@ -376,8 +402,7 @@ class FastAPIRepositories:
         repository_metadata = get_repository_metadata_for_management(trans, encoded_repository_id, changeset_revision)
         repository_metadata.malicious = False
         trans.sa_session.add(repository_metadata)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.put(
@@ -391,12 +416,10 @@ class FastAPIRepositories:
         encoded_repository_id: str = RepositoryIdPathParam,
     ):
         repository = get_repository_in_tool_shed(self.app, encoded_repository_id)
-        if not can_manage_repo(trans, repository):
-            raise InsufficientPermissionsException("You do not have permission to update this repository.")
+        ensure_can_manage(trans, repository)
         repository.deprecated = True
         trans.sa_session.add(repository)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.delete(
@@ -410,12 +433,10 @@ class FastAPIRepositories:
         encoded_repository_id: str = RepositoryIdPathParam,
     ):
         repository = get_repository_in_tool_shed(self.app, encoded_repository_id)
-        if not can_manage_repo(trans, repository):
-            raise InsufficientPermissionsException("You do not have permission to update this repository.")
+        ensure_can_manage(trans, repository)
         repository.deprecated = False
         trans.sa_session.add(repository)
-        with transaction(trans.sa_session):
-            trans.sa_session.commit()
+        trans.sa_session.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
     @router.delete(
@@ -471,7 +492,7 @@ class FastAPIRepositories:
                 dir=trans.app.config.new_file_path, prefix="upload_file_data_", delete=False
             ) as dest:
                 upload_file_like: IO[bytes] = the_file.file
-                shutil.copyfileobj(upload_file_like, dest)  # type: ignore[misc] # https://github.com/python/mypy/issues/15031
+                shutil.copyfileobj(upload_file_like, dest)
             the_file.file.close()
             filename = dest.name
             try:
@@ -482,7 +503,7 @@ class FastAPIRepositories:
                     filename,
                     commit_message or revision_request.commit_message or "Uploaded",
                 )
-                return RepositoryUpdate(__root__=ValidRepostiroyUpdateMessage(message=message))
+                return RepositoryUpdate(root=ValidRepostiroyUpdateMessage(message=message))
             finally:
                 if os.path.exists(filename):
                     os.remove(filename)
@@ -506,9 +527,3 @@ class FastAPIRepositories:
     ) -> dict:
         repository = get_repository_in_tool_shed(self.app, encoded_repository_id)
         return readmes(self.app, repository, changeset_revision)
-
-
-def _hack_fastapi_4428(as_dict) -> dict:
-    # https://github.com/tiangolo/fastapi/pull/4428#issuecomment-1145429263
-    # after pydantic2 swap to really returning the object
-    return RepositoryMetadata(__root__=as_dict).dict()["__root__"]

@@ -46,7 +46,8 @@
                 title="Disconnect External Identity"
                 class="d-block mt-3"
                 @click="onDisconnect(item)">
-                Disconnect {{ item.provider.charAt(0).toUpperCase() + item.provider.slice(1) }} - {{ item.email }}
+                Disconnect {{ capitalizeAsTitle(item.provider_label) }} -
+                {{ item.email }}
             </b-button>
 
             <b-modal
@@ -85,7 +86,7 @@
 
         <div v-if="enable_oidc" class="external-subheading">
             <h2 class="h-md">Connect Other External Identities</h2>
-            <ExternalLogin :login_page="false" />
+            <ExternalLogin />
         </div>
     </section>
 </template>
@@ -97,6 +98,8 @@ import { Toast } from "composables/toast";
 import { sanitize } from "dompurify";
 import { userLogout } from "utils/logout";
 import Vue from "vue";
+
+import { capitalizeFirstLetter } from "@/utils/strings";
 
 import svc from "./service";
 
@@ -156,6 +159,9 @@ export default {
         Toast.success(notificationMessage);
     },
     methods: {
+        capitalizeAsTitle(str) {
+            return capitalizeFirstLetter(str);
+        },
         loadIdentities() {
             this.loading = true;
             svc.getIdentityProviders()

@@ -1,5 +1,7 @@
 """Typed description of Galaxy's app object."""
+
 import abc
+import threading
 from typing import (
     Any,
     Optional,
@@ -30,7 +32,6 @@ from galaxy.quota import QuotaAgent
 from galaxy.security.idencoding import IdEncodingHelper
 from galaxy.security.vault import Vault
 from galaxy.tool_shed.cache import ToolShedRepositoryCache
-from galaxy.tool_util.data import ToolDataTableManager
 from galaxy.tool_util.deps.containers import ContainerFinder
 from galaxy.tool_util.deps.views import DependencyResolversView
 from galaxy.tool_util.verify import test_data
@@ -45,8 +46,14 @@ if TYPE_CHECKING:
     from galaxy.managers.collections import DatasetCollectionManager
     from galaxy.managers.hdas import HDAManager
     from galaxy.managers.histories import HistoryManager
-    from galaxy.managers.workflows import WorkflowsManager
+    from galaxy.managers.tools import DynamicToolManager
+    from galaxy.managers.workflows import (
+        WorkflowContentsManager,
+        WorkflowsManager,
+    )
+    from galaxy.tool_shed.galaxy_install.client import DataManagersInterface
     from galaxy.tool_shed.galaxy_install.installed_repository_manager import InstalledRepositoryManager
+    from galaxy.tool_util.data import ToolDataTableManager
     from galaxy.tools import ToolBox
     from galaxy.tools.cache import ToolCache
     from galaxy.tools.error_reports import ErrorReports
@@ -95,27 +102,29 @@ class MinimalApp(BasicSharedApp):
     install_model: ModelMapping
     security_agent: GalaxyRBACAgent
     host_security_agent: HostAgent
+    server_starttime: int
 
 
 class MinimalManagerApp(MinimalApp):
     # Minimal App that is sufficient to run Celery tasks
+    carbon_intensity: float
     file_sources: ConfiguredFileSources
     genome_builds: GenomeBuilds
+    geographical_server_location_name: str
     dataset_collection_manager: "DatasetCollectionManager"
     tool_data_tables: "ToolDataTableManager"
     history_manager: "HistoryManager"
     hda_manager: "HDAManager"
     workflow_manager: "WorkflowsManager"
-    workflow_contents_manager: Any  # 'galaxy.managers.workflows.WorkflowContentsManager'
+    workflow_contents_manager: "WorkflowContentsManager"
     library_folder_manager: Any  # 'galaxy.managers.folders.FolderManager'
     library_manager: Any  # 'galaxy.managers.libraries.LibraryManager'
     role_manager: Any  # 'galaxy.managers.roles.RoleManager'
-    installed_repository_manager: "InstalledRepositoryManager"
     user_manager: Any
     job_config: "JobConfiguration"
     job_manager: Any  # galaxy.jobs.manager.JobManager
     job_metrics: JobMetrics
-    dynamic_tool_manager: Any  # 'galaxy.managers.tools.DynamicToolManager'
+    dynamic_tool_manager: "DynamicToolManager"
     genomes: "Genomes"
     error_reports: "ErrorReports"
     notification_manager: Any  # 'galaxy.managers.notification.NotificationManager'
@@ -124,11 +133,9 @@ class MinimalManagerApp(MinimalApp):
 
     @property
     @abc.abstractmethod
-    def is_job_handler(self) -> bool:
-        ...
+    def is_job_handler(self) -> bool: ...
 
-    def wait_for_toolbox_reload(self, old_toolbox: "ToolBox") -> None:
-        ...
+    def wait_for_toolbox_reload(self, old_toolbox: "ToolBox") -> None: ...
 
 
 class StructuredApp(MinimalManagerApp):
@@ -144,7 +151,9 @@ class StructuredApp(MinimalManagerApp):
     """
 
     amqp_internal_connection_obj: Optional[Connection]
+    data_managers: "DataManagersInterface"
     dependency_resolvers_view: DependencyResolversView
+    installed_repository_manager: "InstalledRepositoryManager"
     container_finder: ContainerFinder
     tool_dependency_dir: Optional[str]
     test_data_resolver: test_data.TestDataResolver
@@ -153,7 +162,6 @@ class StructuredApp(MinimalManagerApp):
     webhooks_registry: WebhooksRegistry
     queue_worker: Any  # 'galaxy.queue_worker.GalaxyQueueWorker'
     data_provider_registry: Any  # 'galaxy.visualization.data_providers.registry.DataProviderRegistry'
-    tool_data_tables: ToolDataTableManager
     tool_cache: "ToolCache"
     tool_shed_repository_cache: Optional[ToolShedRepositoryCache]
     watchers: "ConfigWatchers"
@@ -161,3 +169,4 @@ class StructuredApp(MinimalManagerApp):
     interactivetool_manager: Any
     api_keys_manager: Any  # 'galaxy.managers.api_keys.ApiKeyManager'
     visualizations_registry: Any  # 'galaxy.visualization.plugins.registry.VisualizationsRegistry'
+    _toolbox_lock: threading.RLock
